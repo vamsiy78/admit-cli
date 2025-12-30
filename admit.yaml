@@ -1,0 +1,18 @@
+# Example admit.yaml schema
+# This file declares configuration requirements that must be satisfied
+# before the target command can execute.
+
+config:
+  db.url:
+    type: string
+    required: true
+
+  payments.mode:
+    type: enum
+    values: [test, live]
+    required: true
+
+  log.level:
+    type: enum
+    values: [debug, info, warn, error]
+    required: false
