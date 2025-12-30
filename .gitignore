@@ -1,8 +1,8 @@
 # Kiro IDE
 .kiro/
 
-# Binary
-admit
+# Binary (only in root)
+/admit
 
 # Go
 *.exe
