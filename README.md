@@ -2,11 +2,71 @@
 
 A system-level execution gate that validates runtime configuration before launching applications. If config is invalid, the process never starts.
 
+## Why Admit?
+
+**The Problem:** Runtime configuration errors are one of the most common causes of production incidents. Applications start with missing database URLs, invalid API keys, or wrong environment settings - then crash minutes or hours later when that code path is hit. By then, you're debugging in production.
+
+**Traditional approaches fail:**
+- **Environment variable checks in code** - Scattered, inconsistent, often forgotten. The app starts, then crashes later.
+- **Config libraries** - Still require code changes, still let the app start before validation.
+- **Container health checks** - Only catch issues after the container is running.
+- **CI/CD validation** - Catches typos but not runtime environment mismatches.
+
+**Admit's approach:** Validate configuration *before* the process even starts. If config is invalid, `execve` never happens. Your application code never runs with bad config.
+
+```
+Without Admit:                    With Admit:
+┌─────────────┐                   ┌─────────────┐
+│ App Starts  │                   │ Admit Runs  │
+└──────┬──────┘                   └──────┬──────┘
+       │                                 │
+       ▼                                 ▼
+┌─────────────┐                   ┌─────────────┐
+│ Config Load │                   │  Validate   │
+│  (maybe)    │                   │   Config    │
+└──────┬──────┘                   └──────┬──────┘
+       │                                 │
+       ▼                          ┌──────┴──────┐
+┌─────────────┐                   │             │
+│   Run...    │              [INVALID]     [VALID]
+│   Run...    │                   │             │
+│   Run...    │                   ▼             ▼
+└──────┬──────┘             ┌─────────┐   ┌─────────┐
+       │                    │  Exit   │   │  execve │
+       ▼                    │  Error  │   │  (app)  │
+┌─────────────┐             └─────────┘   └─────────┘
+│   CRASH!    │              App never     App runs
+│ Missing DB  │              started       with valid
+│   config    │                            config
+└─────────────┘
+```
+
+## Key Benefits
+
+- **Fail fast, fail early** - Bad config = no process. Period.
+- **Zero code changes** - Works with any application, any language. Just wrap your command.
+- **Declarative schemas** - Define config requirements in YAML, not scattered code.
+- **Runtime invariants** - Enforce rules like "prod environment must use prod database".
+- **Container-native** - Perfect for Docker ENTRYPOINT, Kubernetes probes, CI pipelines.
+- **Complete error reporting** - All validation errors shown at once, not one at a time.
+- **Audit trail** - Content-addressable config artifacts for compliance and debugging.
+
 ## Overview
 
 Admit is a launcher primitive that owns the execve boundary. It reads a schema file declaring configuration requirements, resolves values from environment variables, validates them against constraints, and only executes the target command if all invariants are satisfied.
 
 **Core Principle:** `app_started ⟹ config_valid`
+
+## Use Cases
+
+| Scenario | How Admit Helps |
+|----------|-----------------|
+| **Production deployments** | Prevent starts with wrong DB, missing secrets, invalid feature flags |
+| **Container orchestration** | Health checks via `admit check`, ENTRYPOINT validation |
+| **CI/CD pipelines** | Pre-flight config validation with GitHub Actions annotations |
+| **Multi-environment apps** | Invariants ensure prod config in prod, staging in staging |
+| **Compliance & auditing** | Immutable config artifacts with content-addressable hashes |
+| **Debugging** | Execution identity ties code version + config version together |
 
 ## Installation
 
