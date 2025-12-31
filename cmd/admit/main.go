@@ -11,6 +11,7 @@ import (
 	"admit/internal/artifact"
 	"admit/internal/baseline"
 	"admit/internal/cli"
+	"admit/internal/contract"
 	"admit/internal/drift"
 	"admit/internal/execid"
 	"admit/internal/identity"
@@ -141,6 +142,54 @@ func run(args []string, environ []string, defaultSchemaDir string) int {
 			}
 			// Exit with code 2 for invariant violations
 			return 2
+		}
+	}
+
+	// Evaluate environment contracts (v7 feature)
+	// Skip if no environment specified (--env flag or ADMIT_ENV)
+	// Skip if no environments section in schema
+	envName := resolveEnvironment(cmd.Env, environ)
+	if envName != "" && len(s.Environments) > 0 {
+		// Check if the specified environment exists
+		envContract, exists := s.Environments[envName]
+		if !exists {
+			fmt.Fprintf(os.Stderr, "Error: unknown environment '%s'\n", envName)
+			return 1
+		}
+
+		// Build config values map from resolved values
+		configValues := make(map[string]string)
+		for _, rv := range resolved {
+			if rv.Present {
+				configValues[rv.Key] = rv.Value
+			}
+		}
+
+		// Evaluate contract
+		contractResult := contract.Evaluate(envContract, configValues)
+
+		// Handle --contract-json flag
+		if cmd.ContractJSON {
+			jsonOutput, err := contract.FormatJSON(contractResult)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: cannot format contract results: %v\n", err)
+				return 1
+			}
+			fmt.Println(jsonOutput)
+		}
+
+		// Check for violations
+		if !contractResult.Passed {
+			// Report all violations to stderr (unless JSON mode already printed)
+			if !cmd.ContractJSON {
+				if ciMode {
+					fmt.Fprint(os.Stderr, contract.FormatCI(contractResult))
+				} else {
+					fmt.Fprint(os.Stderr, contract.FormatCLI(contractResult))
+				}
+			}
+			// Exit with code 5 for contract violations - do NOT execute command
+			return 5
 		}
 	}
 
@@ -425,6 +474,17 @@ func getAdmitEnv(environ []string) string {
 		}
 	}
 	return ""
+}
+
+// resolveEnvironment determines the environment name from --env flag or ADMIT_ENV
+// Flag takes precedence over environment variable
+func resolveEnvironment(flagValue string, environ []string) string {
+	// Flag takes precedence
+	if flagValue != "" {
+		return flagValue
+	}
+	// Fall back to ADMIT_ENV environment variable
+	return getAdmitEnv(environ)
 }
 
 // getEnvBool checks if an environment variable is set to a truthy value

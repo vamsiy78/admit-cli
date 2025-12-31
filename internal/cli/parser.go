@@ -72,6 +72,10 @@ type Command struct {
 	DriftJSON      bool   // --drift-json (output drift as JSON)
 	BaselineAction string // "list", "show", "delete" for baseline subcommand
 	BaselineName   string // name argument for baseline show/delete
+
+	// v7 Environment Contract flags
+	Env          string // --env <name> (environment for contract evaluation)
+	ContractJSON bool   // --contract-json (output contract violations as JSON)
 }
 
 // ParseArgs parses CLI arguments into a Command.
@@ -205,6 +209,14 @@ func ParseArgs(args []string) (Command, error) {
 				}
 			case "drift-json":
 				cmd.DriftJSON = true
+			case "env":
+				if i+1 >= len(args) {
+					return Command{}, ErrMissingFlagValue
+				}
+				i++
+				cmd.Env = args[i]
+			case "contract-json":
+				cmd.ContractJSON = true
 			default:
 				// Unknown flag - treat as start of command
 				break

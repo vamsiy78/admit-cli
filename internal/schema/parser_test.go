@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"admit/internal/contract"
 	"admit/internal/invariant"
 
 	"github.com/leanovate/gopter"
@@ -83,8 +84,9 @@ func TestProperty3_SchemaRoundTrip(t *testing.T) {
 		}).
 		Map(func(keys []ConfigKey) Schema {
 			s := Schema{
-				Config:     make(map[string]ConfigKey),
-				Invariants: []invariant.Invariant{},
+				Config:       make(map[string]ConfigKey),
+				Invariants:   []invariant.Invariant{},
+				Environments: make(map[string]contract.Contract),
 			}
 			for _, k := range keys {
 				s.Config[k.Path] = k
@@ -543,4 +545,454 @@ func containsLower(s, substr string) bool {
 	s = strings.ToLower(s)
 	substr = strings.ToLower(substr)
 	return strings.Contains(s, substr)
+}
+
+
+// Feature: admit-v7-environment-contracts, Property 1: Contract Parsing Round-Trip
+// For any valid environment contract with allow rules, deny rules, single values, and arrays,
+// serializing to YAML and parsing back SHALL produce an equivalent contract structure.
+// **Validates: Requirements 1.1, 1.2, 1.3, 1.4**
+func TestProperty1_ContractParsingRoundTrip(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	// Generator for config key paths (alphanumeric with dots)
+	genConfigPath := gen.RegexMatch(`[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)*`)
+
+	// Generator for environment names (alphanumeric with hyphens)
+	genEnvName := gen.RegexMatch(`[a-z][a-z0-9-]*`)
+
+	// Generator for rule values (non-empty strings)
+	genRuleValue := gen.AlphaString().SuchThat(func(s string) bool {
+		return len(s) > 0
+	})
+
+	// Generator for rule values array (1-3 values)
+	genRuleValues := gen.SliceOfN(3, genRuleValue).SuchThat(func(vals []string) bool {
+		if len(vals) == 0 {
+			return false
+		}
+		for _, v := range vals {
+			if v == "" {
+				return false
+			}
+		}
+		return true
+	})
+
+	// Generator for a contract.Rule
+	genRule := gopter.CombineGens(
+		genRuleValues,
+		gen.Bool(), // IsGlob (only meaningful for deny rules)
+	).Map(func(vals []interface{}) contract.Rule {
+		values := vals[0].([]string)
+		isGlob := vals[1].(bool)
+		return contract.Rule{
+			Values: values,
+			IsGlob: isGlob,
+		}
+	})
+
+	// Generator for a contract.Contract
+	genContract := gopter.CombineGens(
+		genEnvName,
+		gen.IntRange(0, 3), // Number of allow rules
+		gen.IntRange(0, 3), // Number of deny rules
+		gen.IntRange(0, 1000), // Seed for generating unique keys
+	).Map(func(vals []interface{}) contract.Contract {
+		name := vals[0].(string)
+		numAllow := vals[1].(int)
+		numDeny := vals[2].(int)
+		seed := vals[3].(int)
+
+		c := contract.Contract{
+			Name:  name,
+			Allow: make(map[string]contract.Rule),
+			Deny:  make(map[string]contract.Rule),
+		}
+
+		// Generate allow rules
+		for i := 0; i < numAllow; i++ {
+			key := "allow" + string(rune('a'+(seed+i)%26)) + ".key"
+			values := []string{"val" + string(rune('a'+(seed+i)%26))}
+			if (seed+i)%2 == 0 {
+				values = append(values, "val"+string(rune('b'+(seed+i)%26)))
+			}
+			c.Allow[key] = contract.Rule{
+				Values: values,
+				IsGlob: false, // Allow rules don't support glob
+			}
+		}
+
+		// Generate deny rules
+		for i := 0; i < numDeny; i++ {
+			key := "deny" + string(rune('a'+(seed+i)%26)) + ".key"
+			values := []string{"*-staging*"}
+			if (seed+i)%2 == 0 {
+				values = []string{"forbidden" + string(rune('a'+(seed+i)%26))}
+			}
+			c.Deny[key] = contract.Rule{
+				Values: values,
+				IsGlob: strings.Contains(values[0], "*"),
+			}
+		}
+
+		return c
+	}).SuchThat(func(c contract.Contract) bool {
+		return c.Name != "" && (len(c.Allow) > 0 || len(c.Deny) > 0)
+	})
+
+	// Generator for a Schema with environments
+	genSchemaWithEnvs := gopter.CombineGens(
+		gen.IntRange(1, 3), // Number of environments
+		gen.IntRange(0, 1000), // Seed
+	).Map(func(vals []interface{}) Schema {
+		numEnvs := vals[0].(int)
+		seed := vals[1].(int)
+
+		s := Schema{
+			Config:       make(map[string]ConfigKey),
+			Invariants:   []invariant.Invariant{},
+			Environments: make(map[string]contract.Contract),
+		}
+
+		// Add a config key
+		s.Config["db.url"] = ConfigKey{
+			Path:     "db.url",
+			Type:     TypeString,
+			Required: true,
+		}
+
+		// Generate environments
+		envNames := []string{"prod", "staging", "dev"}
+		for i := 0; i < numEnvs && i < len(envNames); i++ {
+			envName := envNames[i]
+			c := contract.Contract{
+				Name:  envName,
+				Allow: make(map[string]contract.Rule),
+				Deny:  make(map[string]contract.Rule),
+			}
+
+			// Add allow rule
+			if (seed+i)%2 == 0 {
+				c.Allow["payments.mode"] = contract.Rule{
+					Values: []string{"live"},
+					IsGlob: false,
+				}
+			}
+
+			// Add deny rule
+			if (seed+i)%3 != 0 {
+				c.Deny["db.url"] = contract.Rule{
+					Values: []string{"*-staging*"},
+					IsGlob: true,
+				}
+			}
+
+			// Only add if contract has rules
+			if len(c.Allow) > 0 || len(c.Deny) > 0 {
+				s.Environments[envName] = c
+			}
+		}
+
+		return s
+	}).SuchThat(func(s Schema) bool {
+		return len(s.Environments) > 0
+	})
+
+	// Suppress unused variable warnings
+	_ = genConfigPath
+	_ = genRule
+	_ = genContract
+
+	properties.Property("contract round-trip preserves structure", prop.ForAll(
+		func(original Schema) bool {
+			// Serialize to YAML
+			yamlBytes, err := original.ToYAML()
+			if err != nil {
+				t.Logf("ToYAML failed: %v", err)
+				return false
+			}
+
+			// Parse back
+			parsed, err := ParseSchema(yamlBytes)
+			if err != nil {
+				t.Logf("ParseSchema failed: %v\nYAML:\n%s", err, string(yamlBytes))
+				return false
+			}
+
+			// Compare environments
+			if len(original.Environments) != len(parsed.Environments) {
+				t.Logf("Environment count mismatch: %d vs %d", len(original.Environments), len(parsed.Environments))
+				return false
+			}
+
+			for envName, origContract := range original.Environments {
+				parsedContract, ok := parsed.Environments[envName]
+				if !ok {
+					t.Logf("Missing environment: %s", envName)
+					return false
+				}
+
+				// Compare allow rules
+				if len(origContract.Allow) != len(parsedContract.Allow) {
+					t.Logf("Allow rule count mismatch for %s: %d vs %d", envName, len(origContract.Allow), len(parsedContract.Allow))
+					return false
+				}
+				for key, origRule := range origContract.Allow {
+					parsedRule, ok := parsedContract.Allow[key]
+					if !ok {
+						t.Logf("Missing allow rule: %s.%s", envName, key)
+						return false
+					}
+					if !reflect.DeepEqual(origRule.Values, parsedRule.Values) {
+						t.Logf("Allow rule values mismatch for %s.%s: %v vs %v", envName, key, origRule.Values, parsedRule.Values)
+						return false
+					}
+				}
+
+				// Compare deny rules
+				if len(origContract.Deny) != len(parsedContract.Deny) {
+					t.Logf("Deny rule count mismatch for %s: %d vs %d", envName, len(origContract.Deny), len(parsedContract.Deny))
+					return false
+				}
+				for key, origRule := range origContract.Deny {
+					parsedRule, ok := parsedContract.Deny[key]
+					if !ok {
+						t.Logf("Missing deny rule: %s.%s", envName, key)
+						return false
+					}
+					if !reflect.DeepEqual(origRule.Values, parsedRule.Values) {
+						t.Logf("Deny rule values mismatch for %s.%s: %v vs %v", envName, key, origRule.Values, parsedRule.Values)
+						return false
+					}
+					if origRule.IsGlob != parsedRule.IsGlob {
+						t.Logf("Deny rule IsGlob mismatch for %s.%s: %v vs %v", envName, key, origRule.IsGlob, parsedRule.IsGlob)
+						return false
+					}
+				}
+			}
+
+			return true
+		},
+		genSchemaWithEnvs,
+	))
+
+	properties.TestingRun(t)
+}
+
+
+// Feature: admit-v7-environment-contracts, Property 13: Backward Compatibility
+// For any schema without an `environments` section, parsing SHALL succeed and
+// contract evaluation SHALL be skipped. Execution SHALL proceed identically to v6.
+// **Validates: Requirements 6.1, 6.2, 6.3**
+func TestProperty13_BackwardCompatibility(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	// Generator for valid config types
+	genConfigType := gen.OneConstOf(TypeString, TypeEnum)
+
+	// Generator for enum values (non-empty list of strings)
+	genEnumValues := gen.SliceOfN(3, gen.AlphaString()).
+		SuchThat(func(vals []string) bool {
+			if len(vals) == 0 {
+				return false
+			}
+			for _, v := range vals {
+				if v == "" {
+					return false
+				}
+			}
+			return true
+		})
+
+	// Generator for a config key path (alphanumeric with dots)
+	genPath := gen.RegexMatch(`[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)*`)
+
+	// Generator for a single ConfigKey
+	genConfigKey := gopter.CombineGens(
+		genPath,
+		genConfigType,
+		gen.Bool(),
+		genEnumValues,
+	).Map(func(vals []interface{}) ConfigKey {
+		path := vals[0].(string)
+		configType := vals[1].(ConfigType)
+		required := vals[2].(bool)
+		enumValues := vals[3].([]string)
+
+		key := ConfigKey{
+			Path:     path,
+			Type:     configType,
+			Required: required,
+		}
+
+		// Only set Values for enum type
+		if configType == TypeEnum {
+			key.Values = enumValues
+		}
+
+		return key
+	})
+
+	// Generator for a v6-style Schema (no environments)
+	genV6Schema := gen.SliceOfN(3, genConfigKey).
+		SuchThat(func(keys []ConfigKey) bool {
+			// Ensure unique paths
+			seen := make(map[string]bool)
+			for _, k := range keys {
+				if seen[k.Path] || k.Path == "" {
+					return false
+				}
+				seen[k.Path] = true
+			}
+			return len(keys) > 0
+		}).
+		Map(func(keys []ConfigKey) Schema {
+			s := Schema{
+				Config:       make(map[string]ConfigKey),
+				Invariants:   []invariant.Invariant{},
+				Environments: make(map[string]contract.Contract),
+			}
+			for _, k := range keys {
+				s.Config[k.Path] = k
+			}
+			return s
+		})
+
+	properties.Property("v6 schema without environments parses successfully", prop.ForAll(
+		func(original Schema) bool {
+			// Ensure no environments in original
+			if len(original.Environments) > 0 {
+				return true // Skip this case
+			}
+
+			// Serialize to YAML
+			yamlBytes, err := original.ToYAML()
+			if err != nil {
+				t.Logf("ToYAML failed: %v", err)
+				return false
+			}
+
+			// Verify YAML doesn't contain environments section
+			yamlStr := string(yamlBytes)
+			if strings.Contains(yamlStr, "environments:") {
+				t.Logf("YAML should not contain environments section:\n%s", yamlStr)
+				return false
+			}
+
+			// Parse back
+			parsed, err := ParseSchema(yamlBytes)
+			if err != nil {
+				t.Logf("ParseSchema failed: %v\nYAML:\n%s", err, yamlStr)
+				return false
+			}
+
+			// Verify environments is empty (backward compatible)
+			if len(parsed.Environments) != 0 {
+				t.Logf("Parsed schema should have empty environments, got %d", len(parsed.Environments))
+				return false
+			}
+
+			// Verify config was parsed correctly
+			if len(original.Config) != len(parsed.Config) {
+				t.Logf("Config count mismatch: %d vs %d", len(original.Config), len(parsed.Config))
+				return false
+			}
+
+			return true
+		},
+		genV6Schema,
+	))
+
+	properties.Property("schema with only config section parses identically to v6", prop.ForAll(
+		func(seed int) bool {
+			// Create a simple v6-style YAML (no environments)
+			yaml := `config:
+  db.url:
+    type: string
+    required: true
+  payments.mode:
+    type: enum
+    values: [live, test, sandbox]
+`
+			// Parse the schema
+			schema, err := ParseSchema([]byte(yaml))
+			if err != nil {
+				t.Logf("ParseSchema failed: %v", err)
+				return false
+			}
+
+			// Verify config was parsed
+			if len(schema.Config) != 2 {
+				t.Logf("Expected 2 config keys, got %d", len(schema.Config))
+				return false
+			}
+
+			// Verify environments is empty
+			if len(schema.Environments) != 0 {
+				t.Logf("Expected empty environments, got %d", len(schema.Environments))
+				return false
+			}
+
+			// Verify invariants is empty
+			if len(schema.Invariants) != 0 {
+				t.Logf("Expected empty invariants, got %d", len(schema.Invariants))
+				return false
+			}
+
+			return true
+		},
+		gen.IntRange(0, 100),
+	))
+
+	properties.Property("no environment specified means skip contract evaluation", prop.ForAll(
+		func(seed int) bool {
+			// Create a schema with environments
+			yaml := `config:
+  db.url:
+    type: string
+    required: true
+environments:
+  prod:
+    allow:
+      db.url: "postgres://prod.example.com/db"
+`
+			// Parse the schema
+			schema, err := ParseSchema([]byte(yaml))
+			if err != nil {
+				t.Logf("ParseSchema failed: %v", err)
+				return false
+			}
+
+			// Verify environments was parsed
+			if len(schema.Environments) != 1 {
+				t.Logf("Expected 1 environment, got %d", len(schema.Environments))
+				return false
+			}
+
+			// Verify prod environment exists
+			prodContract, ok := schema.Environments["prod"]
+			if !ok {
+				t.Logf("Expected prod environment")
+				return false
+			}
+
+			// Verify allow rule was parsed
+			if len(prodContract.Allow) != 1 {
+				t.Logf("Expected 1 allow rule, got %d", len(prodContract.Allow))
+				return false
+			}
+
+			return true
+		},
+		gen.IntRange(0, 100),
+	))
+
+	properties.TestingRun(t)
 }

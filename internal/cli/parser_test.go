@@ -1406,3 +1406,177 @@ func TestParseArgs_V6BackwardCompatibility_Property(t *testing.T) {
 
 	properties.TestingRun(t)
 }
+
+
+// TestParseArgs_V7ContractFlags tests the v7 environment contract flags
+func TestParseArgs_V7ContractFlags(t *testing.T) {
+	tests := []struct {
+		name             string
+		args             []string
+		wantTarget       string
+		wantEnv          string
+		wantContractJSON bool
+	}{
+		{
+			name:       "run with --env",
+			args:       []string{"run", "--env", "prod", "echo"},
+			wantTarget: "echo",
+			wantEnv:    "prod",
+		},
+		{
+			name:       "run with --env staging",
+			args:       []string{"run", "--env", "staging", "node", "app.js"},
+			wantTarget: "node",
+			wantEnv:    "staging",
+		},
+		{
+			name:             "run with --contract-json",
+			args:             []string{"run", "--contract-json", "echo"},
+			wantTarget:       "echo",
+			wantContractJSON: true,
+		},
+		{
+			name:             "run with --env and --contract-json",
+			args:             []string{"run", "--env", "prod", "--contract-json", "echo"},
+			wantTarget:       "echo",
+			wantEnv:          "prod",
+			wantContractJSON: true,
+		},
+		{
+			name:             "run with all v7 flags and other flags",
+			args:             []string{"run", "--env", "prod", "--contract-json", "--dry-run", "node", "app.js"},
+			wantTarget:       "node",
+			wantEnv:          "prod",
+			wantContractJSON: true,
+		},
+		{
+			name:       "run without v7 flags",
+			args:       []string{"run", "echo"},
+			wantTarget: "echo",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, err := ParseArgs(tt.args)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cmd.Target != tt.wantTarget {
+				t.Errorf("Target = %q, want %q", cmd.Target, tt.wantTarget)
+			}
+			if cmd.Env != tt.wantEnv {
+				t.Errorf("Env = %q, want %q", cmd.Env, tt.wantEnv)
+			}
+			if cmd.ContractJSON != tt.wantContractJSON {
+				t.Errorf("ContractJSON = %v, want %v", cmd.ContractJSON, tt.wantContractJSON)
+			}
+		})
+	}
+}
+
+// TestParseArgs_V7FlagErrors tests error cases for v7 flags
+func TestParseArgs_V7FlagErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr error
+	}{
+		{
+			name:    "env without value",
+			args:    []string{"run", "--env"},
+			wantErr: ErrMissingFlagValue,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseArgs(tt.args)
+			if err != tt.wantErr {
+				t.Errorf("error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+
+// Feature: admit-v7-environment-contracts, Property 8: Environment Selection Precedence
+// Validates: Requirements 4.1, 4.2, 4.3
+// For any execution with --env flag provided, the flag value SHALL be captured.
+// The precedence logic (flag over ADMIT_ENV) is tested at the integration level.
+func TestParseArgs_V7EnvironmentSelection_Property(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	// Property: --env flag value is captured correctly
+	properties.Property("env flag value is captured correctly", prop.ForAll(
+		func(envName string, target string) bool {
+			if envName == "" || target == "" {
+				return true // Skip empty values
+			}
+			args := []string{"run", "--env", envName, target}
+			cmd, err := ParseArgs(args)
+			if err != nil {
+				return false
+			}
+			return cmd.Env == envName && cmd.Target == target
+		},
+		gen.Identifier(),
+		gen.Identifier(),
+	))
+
+	// Property: --env flag works with other flags
+	properties.Property("env flag works with other flags", prop.ForAll(
+		func(envName string, target string) bool {
+			if envName == "" || target == "" {
+				return true
+			}
+			args := []string{"run", "--env", envName, "--contract-json", "--dry-run", target}
+			cmd, err := ParseArgs(args)
+			if err != nil {
+				return false
+			}
+			return cmd.Env == envName && cmd.ContractJSON && cmd.DryRun && cmd.Target == target
+		},
+		gen.Identifier(),
+		gen.Identifier(),
+	))
+
+	// Property: without --env flag, Env field is empty
+	properties.Property("without env flag, Env field is empty", prop.ForAll(
+		func(target string, args []string) bool {
+			if target == "" {
+				return true
+			}
+			inputArgs := append([]string{"run", target}, args...)
+			cmd, err := ParseArgs(inputArgs)
+			if err != nil {
+				return false
+			}
+			return cmd.Env == ""
+		},
+		gen.Identifier(),
+		gen.SliceOf(gen.AlphaString()),
+	))
+
+	// Property: v6 flags still work with v7 flags
+	properties.Property("v6 and v7 flags can coexist", prop.ForAll(
+		func(envName string, target string) bool {
+			if envName == "" || target == "" {
+				return true
+			}
+			args := []string{"run", "--env", envName, "--baseline", "default", "--detect-drift", "default", target}
+			cmd, err := ParseArgs(args)
+			if err != nil {
+				return false
+			}
+			return cmd.Env == envName && cmd.Baseline == "default" && cmd.DetectDrift == "default" && cmd.Target == target
+		},
+		gen.Identifier(),
+		gen.Identifier(),
+	))
+
+	properties.TestingRun(t)
+}

@@ -3545,3 +3545,652 @@ func TestV6BackwardCompatibility(t *testing.T) {
 		t.Errorf("Expected 'hello' in output, got: %s", output)
 	}
 }
+
+// ============================================================================
+// V7 Integration Tests - Environment Contracts
+// ============================================================================
+
+// TestContractViolationExitCode5 tests that contract violations exit with code 5
+// Validates: Requirements 3.1
+func TestContractViolationExitCode5(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  payments.mode:
+    type: enum
+    values: [test, live, sandbox]
+    required: true
+
+environments:
+  prod:
+    allow:
+      payments.mode: live
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with --env prod but payments.mode=test (violates allow rule)
+	cmd := exec.Command(binPath, "run", "--env", "prod", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"PAYMENTS_MODE=test", // Violates allow rule (only "live" allowed in prod)
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Fatal("Expected command to fail with contract violation")
+	}
+
+	// Check exit code is 5 (contract violation)
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("Expected ExitError, got %T", err)
+	}
+
+	if exitErr.ExitCode() != 5 {
+		t.Errorf("Expected exit code 5 for contract violation, got %d", exitErr.ExitCode())
+	}
+
+	// Stderr should contain violation message
+	stderrStr := stderr.String()
+	if !bytes.Contains([]byte(stderrStr), []byte("Contract violation")) || !bytes.Contains([]byte(stderrStr), []byte("payments.mode")) {
+		t.Errorf("Expected contract violation message in stderr, got: %s", stderrStr)
+	}
+}
+
+// TestContractViolationCommandNotExecuted tests that command is NOT executed on violation
+// Validates: Requirements 3.2
+func TestContractViolationCommandNotExecuted(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  debug.enabled:
+    type: enum
+    values: [true, false]
+    required: true
+
+environments:
+  prod:
+    deny:
+      debug.enabled: "true"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with --env prod and debug.enabled=true (violates deny rule)
+	cmd := exec.Command(binPath, "run", "--env", "prod", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DEBUG_ENABLED=true", // Violates deny rule
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Fatal("Expected command to fail with contract violation")
+	}
+
+	// Marker file should NOT exist (command should not have executed)
+	if _, err := os.Stat(markerFile); err == nil {
+		t.Error("Marker file should not exist - command should not have executed on contract violation")
+	}
+}
+
+// TestContractCompliantExecution tests successful execution when contract is satisfied
+// Validates: Requirements 2.1
+func TestContractCompliantExecution(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  payments.mode:
+    type: enum
+    values: [test, live, sandbox]
+    required: true
+  db.ssl:
+    type: enum
+    values: [true, false]
+    required: true
+
+environments:
+  prod:
+    allow:
+      payments.mode: live
+      db.ssl: "true"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with --env prod and compliant config
+	cmd := exec.Command(binPath, "run", "--env", "prod", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"PAYMENTS_MODE=live", // Compliant
+		"DB_SSL=true",        // Compliant
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected command to succeed with compliant config, got error: %v", err)
+	}
+
+	// Marker file should exist (command executed)
+	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
+		t.Error("Marker file should exist - command should have executed with compliant config")
+	}
+}
+
+// TestContractSkipWhenNoEnvSpecified tests that contract evaluation is skipped when no --env
+// Validates: Requirements 6.2
+func TestContractSkipWhenNoEnvSpecified(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  payments.mode:
+    type: enum
+    values: [test, live, sandbox]
+    required: true
+
+environments:
+  prod:
+    allow:
+      payments.mode: live
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run WITHOUT --env flag - should skip contract evaluation
+	cmd := exec.Command(binPath, "run", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"PAYMENTS_MODE=test", // Would violate prod contract, but no env specified
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected command to succeed when no env specified, got error: %v", err)
+	}
+
+	// Marker file should exist (command executed)
+	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
+		t.Error("Marker file should exist - command should execute when no env specified")
+	}
+}
+
+// TestContractDenyGlobPattern tests deny rules with glob patterns
+// Validates: Requirements 5.1, 5.2
+func TestContractDenyGlobPattern(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+
+environments:
+  prod:
+    deny:
+      db.url: "*-staging*"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with --env prod and db.url containing "-staging" (matches glob pattern)
+	cmd := exec.Command(binPath, "run", "--env", "prod", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://db-staging-01.example.com/mydb", // Matches *-staging*
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Fatal("Expected command to fail with contract violation (glob pattern match)")
+	}
+
+	// Check exit code is 5
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("Expected ExitError, got %T", err)
+	}
+
+	if exitErr.ExitCode() != 5 {
+		t.Errorf("Expected exit code 5, got %d", exitErr.ExitCode())
+	}
+
+	// Marker file should NOT exist
+	if _, err := os.Stat(markerFile); err == nil {
+		t.Error("Marker file should not exist - command should not execute on glob pattern violation")
+	}
+}
+
+// TestContractUnknownEnvironment tests exit code 1 for unknown environment
+// Validates: Requirements 4.5
+func TestContractUnknownEnvironment(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+
+environments:
+  prod:
+    allow:
+      db.url: "postgres://prod.example.com/db"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with --env unknown_env (doesn't exist in schema)
+	cmd := exec.Command(binPath, "run", "--env", "unknown_env", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Fatal("Expected command to fail with unknown environment")
+	}
+
+	// Check exit code is 1 (general error for unknown env)
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("Expected ExitError, got %T", err)
+	}
+
+	if exitErr.ExitCode() != 1 {
+		t.Errorf("Expected exit code 1 for unknown environment, got %d", exitErr.ExitCode())
+	}
+
+	// Stderr should contain error message about unknown environment
+	stderrStr := stderr.String()
+	if !bytes.Contains([]byte(stderrStr), []byte("unknown environment")) {
+		t.Errorf("Expected 'unknown environment' in stderr, got: %s", stderrStr)
+	}
+}
+
+// TestContractADMIT_ENVFallback tests that ADMIT_ENV is used when --env not provided
+// Validates: Requirements 4.2
+func TestContractADMIT_ENVFallback(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  payments.mode:
+    type: enum
+    values: [test, live, sandbox]
+    required: true
+
+environments:
+  prod:
+    allow:
+      payments.mode: live
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with ADMIT_ENV=prod (no --env flag) and violating config
+	cmd := exec.Command(binPath, "run", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=prod",     // Use env var instead of flag
+		"PAYMENTS_MODE=test", // Violates prod contract
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+
+	// Should exit with error (contract violation)
+	if err == nil {
+		t.Fatal("Expected command to fail with contract violation via ADMIT_ENV")
+	}
+
+	// Check exit code is 5
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("Expected ExitError, got %T", err)
+	}
+
+	if exitErr.ExitCode() != 5 {
+		t.Errorf("Expected exit code 5, got %d", exitErr.ExitCode())
+	}
+}
+
+// TestContractFlagPrecedenceOverEnvVar tests that --env flag takes precedence over ADMIT_ENV
+// Validates: Requirements 4.3
+func TestContractFlagPrecedenceOverEnvVar(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  payments.mode:
+    type: enum
+    values: [test, live, sandbox]
+    required: true
+
+environments:
+  prod:
+    allow:
+      payments.mode: live
+  staging:
+    allow:
+      payments.mode: [test, sandbox]
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with --env staging but ADMIT_ENV=prod
+	// payments.mode=test is valid for staging but not prod
+	// Flag should take precedence, so it should succeed
+	cmd := exec.Command(binPath, "run", "--env", "staging", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=prod",     // Would fail if used
+		"PAYMENTS_MODE=test", // Valid for staging, invalid for prod
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected command to succeed (--env staging takes precedence), got error: %v", err)
+	}
+
+	// Marker file should exist
+	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
+		t.Error("Marker file should exist - --env flag should take precedence over ADMIT_ENV")
+	}
+}
+
+// TestContractJSONOutput tests --contract-json flag output
+// Validates: Requirements 3.5
+func TestContractJSONOutput(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  payments.mode:
+    type: enum
+    values: [test, live, sandbox]
+    required: true
+
+environments:
+  prod:
+    allow:
+      payments.mode: live
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with --contract-json and violating config
+	cmd := exec.Command(binPath, "run", "--env", "prod", "--contract-json", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"PAYMENTS_MODE=test", // Violates prod contract
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Fatal("Expected command to fail with contract violation")
+	}
+
+	// Stdout should contain JSON output (Go uses capitalized field names)
+	output := stdout.String()
+	if !bytes.Contains([]byte(output), []byte(`"Environment"`)) {
+		t.Errorf("Expected JSON with 'Environment' field, got: %s", output)
+	}
+	if !bytes.Contains([]byte(output), []byte(`"Passed"`)) {
+		t.Errorf("Expected JSON with 'Passed' field, got: %s", output)
+	}
+	if !bytes.Contains([]byte(output), []byte(`"Violations"`)) {
+		t.Errorf("Expected JSON with 'Violations' field, got: %s", output)
+	}
+}
+
+// TestContractCIMode tests CI mode output for contract violations
+// Validates: Requirements 3.4
+func TestContractCIMode(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  payments.mode:
+    type: enum
+    values: [test, live, sandbox]
+    required: true
+
+environments:
+  prod:
+    allow:
+      payments.mode: live
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with --ci and violating config
+	cmd := exec.Command(binPath, "run", "--env", "prod", "--ci", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"PAYMENTS_MODE=test", // Violates prod contract
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Fatal("Expected command to fail with contract violation")
+	}
+
+	// Stderr should contain GitHub Actions annotation format
+	stderrStr := stderr.String()
+	if !bytes.Contains([]byte(stderrStr), []byte("::error")) {
+		t.Errorf("Expected '::error' GitHub Actions annotation in stderr, got: %s", stderrStr)
+	}
+}
+
+// TestContractBackwardCompatibility tests that schemas without environments work normally
+// Validates: Requirements 6.1, 6.3
+func TestContractBackwardCompatibility(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	// Schema without environments section (v6 style)
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with --env flag but no environments in schema
+	cmd := exec.Command(binPath, "run", "--env", "prod", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected command to succeed (no environments section), got error: %v", err)
+	}
+
+	// Marker file should exist
+	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
+		t.Error("Marker file should exist - backward compatibility should allow execution")
+	}
+}
+
+// TestContractDenyPrecedenceOverAllow tests that deny rules take precedence over allow
+// Validates: Requirements 2.4
+func TestContractDenyPrecedenceOverAllow(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  feature.flag:
+    type: string
+    required: true
+
+environments:
+  prod:
+    allow:
+      feature.flag: [enabled, disabled, beta]
+    deny:
+      feature.flag: beta
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with feature.flag=beta (in allow list but also in deny list)
+	cmd := exec.Command(binPath, "run", "--env", "prod", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"FEATURE_FLAG=beta", // In allow list but also denied
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+
+	// Should exit with error (deny takes precedence)
+	if err == nil {
+		t.Fatal("Expected command to fail - deny should take precedence over allow")
+	}
+
+	// Check exit code is 5
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("Expected ExitError, got %T", err)
+	}
+
+	if exitErr.ExitCode() != 5 {
+		t.Errorf("Expected exit code 5, got %d", exitErr.ExitCode())
+	}
+
+	// Marker file should NOT exist
+	if _, err := os.Stat(markerFile); err == nil {
+		t.Error("Marker file should not exist - deny should take precedence")
+	}
+}
+
+// TestContractMultipleViolationsReported tests that all violations are reported
+// Validates: Requirements 3.6
+func TestContractMultipleViolationsReported(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  payments.mode:
+    type: enum
+    values: [test, live, sandbox]
+    required: true
+  debug.enabled:
+    type: enum
+    values: [true, false]
+    required: true
+
+environments:
+  prod:
+    allow:
+      payments.mode: live
+    deny:
+      debug.enabled: "true"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with multiple violations
+	cmd := exec.Command(binPath, "run", "--env", "prod", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"PAYMENTS_MODE=test",  // Violates allow rule
+		"DEBUG_ENABLED=true",  // Violates deny rule
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Fatal("Expected command to fail with multiple violations")
+	}
+
+	// Stderr should contain both violations
+	stderrStr := stderr.String()
+	if !bytes.Contains([]byte(stderrStr), []byte("payments.mode")) {
+		t.Errorf("Expected payments.mode violation in stderr, got: %s", stderrStr)
+	}
+	if !bytes.Contains([]byte(stderrStr), []byte("debug.enabled")) {
+		t.Errorf("Expected debug.enabled violation in stderr, got: %s", stderrStr)
+	}
+	if !bytes.Contains([]byte(stderrStr), []byte("2 violation")) {
+		t.Errorf("Expected '2 violation' count in stderr, got: %s", stderrStr)
+	}
+}

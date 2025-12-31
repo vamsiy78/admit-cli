@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 
+	"admit/internal/contract"
 	"admit/internal/invariant"
 
 	"gopkg.in/yaml.v3"
@@ -13,8 +15,9 @@ import (
 
 // schemaFile represents the YAML file structure
 type schemaFile struct {
-	Config     map[string]configEntry `yaml:"config"`
-	Invariants []invariantEntry       `yaml:"invariants,omitempty"`
+	Config       map[string]configEntry      `yaml:"config"`
+	Invariants   []invariantEntry            `yaml:"invariants,omitempty"`
+	Environments map[string]environmentEntry `yaml:"environments,omitempty"`
 }
 
 // configEntry represents a single config entry in YAML
@@ -30,6 +33,46 @@ type invariantEntry struct {
 	Rule string `yaml:"rule"`
 }
 
+// environmentEntry represents a single environment contract in YAML
+type environmentEntry struct {
+	Allow map[string]ruleEntry `yaml:"allow,omitempty"`
+	Deny  map[string]ruleEntry `yaml:"deny,omitempty"`
+}
+
+// ruleEntry represents a rule value that can be a single string or array of strings
+type ruleEntry struct {
+	values []string
+}
+
+// UnmarshalYAML implements custom unmarshaling for ruleEntry to handle both
+// single values and arrays
+func (r *ruleEntry) UnmarshalYAML(value *yaml.Node) error {
+	// Try to unmarshal as a single string first
+	var single string
+	if err := value.Decode(&single); err == nil {
+		r.values = []string{single}
+		return nil
+	}
+
+	// Try to unmarshal as an array of strings
+	var array []string
+	if err := value.Decode(&array); err == nil {
+		r.values = array
+		return nil
+	}
+
+	return fmt.Errorf("rule value must be a string or array of strings")
+}
+
+// MarshalYAML implements custom marshaling for ruleEntry
+// Single values are serialized as strings, multiple values as arrays
+func (r ruleEntry) MarshalYAML() (interface{}, error) {
+	if len(r.values) == 1 {
+		return r.values[0], nil
+	}
+	return r.values, nil
+}
+
 // invariantNameRegex validates invariant names: alphanumeric, hyphens, underscores
 var invariantNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
@@ -41,8 +84,9 @@ func ParseSchema(content []byte) (Schema, error) {
 	}
 
 	schema := Schema{
-		Config:     make(map[string]ConfigKey),
-		Invariants: []invariant.Invariant{},
+		Config:       make(map[string]ConfigKey),
+		Invariants:   []invariant.Invariant{},
+		Environments: make(map[string]contract.Contract),
 	}
 
 	for path, entry := range sf.Config {
@@ -113,13 +157,66 @@ func ParseSchema(content []byte) (Schema, error) {
 		}
 	}
 
+	// Parse environments if present
+	if len(sf.Environments) > 0 {
+		for envName, envEntry := range sf.Environments {
+			c, err := parseEnvironmentContract(envName, envEntry)
+			if err != nil {
+				return Schema{}, fmt.Errorf("environment '%s': %w", envName, err)
+			}
+			schema.Environments[envName] = c
+		}
+	}
+
 	return schema, nil
+}
+
+// parseEnvironmentContract converts an environmentEntry to a contract.Contract
+func parseEnvironmentContract(name string, entry environmentEntry) (contract.Contract, error) {
+	c := contract.Contract{
+		Name:  name,
+		Allow: make(map[string]contract.Rule),
+		Deny:  make(map[string]contract.Rule),
+	}
+
+	// Parse allow rules
+	for key, rule := range entry.Allow {
+		if len(rule.values) == 0 {
+			return contract.Contract{}, fmt.Errorf("allow rule for '%s' has no values", key)
+		}
+		c.Allow[key] = contract.Rule{
+			Values: rule.values,
+			IsGlob: false, // Allow rules don't support glob patterns
+		}
+	}
+
+	// Parse deny rules
+	for key, rule := range entry.Deny {
+		if len(rule.values) == 0 {
+			return contract.Contract{}, fmt.Errorf("deny rule for '%s' has no values", key)
+		}
+		// Check if any value contains a glob pattern
+		isGlob := false
+		for _, v := range rule.values {
+			if strings.Contains(v, "*") {
+				isGlob = true
+				break
+			}
+		}
+		c.Deny[key] = contract.Rule{
+			Values: rule.values,
+			IsGlob: isGlob,
+		}
+	}
+
+	return c, nil
 }
 
 // ToYAML serializes a Schema back to YAML bytes
 func (s Schema) ToYAML() ([]byte, error) {
 	sf := schemaFile{
-		Config: make(map[string]configEntry),
+		Config:       make(map[string]configEntry),
+		Environments: make(map[string]environmentEntry),
 	}
 
 	for path, key := range s.Config {
@@ -136,6 +233,26 @@ func (s Schema) ToYAML() ([]byte, error) {
 			Name: inv.Name,
 			Rule: inv.Rule,
 		})
+	}
+
+	// Serialize environments if present
+	for envName, c := range s.Environments {
+		envEntry := environmentEntry{
+			Allow: make(map[string]ruleEntry),
+			Deny:  make(map[string]ruleEntry),
+		}
+		for key, rule := range c.Allow {
+			envEntry.Allow[key] = ruleEntry{values: rule.Values}
+		}
+		for key, rule := range c.Deny {
+			envEntry.Deny[key] = ruleEntry{values: rule.Values}
+		}
+		sf.Environments[envName] = envEntry
+	}
+
+	// Remove empty environments map to avoid serializing empty section
+	if len(sf.Environments) == 0 {
+		sf.Environments = nil
 	}
 
 	return yaml.Marshal(&sf)
