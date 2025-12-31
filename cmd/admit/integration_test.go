@@ -3080,3 +3080,468 @@ func TestV5_SnapshotWithExecutionID(t *testing.T) {
 		t.Errorf("Expected exactly 1 snapshot, got %d", len(entries))
 	}
 }
+
+
+// TestV6BaselineCreation tests baseline creation with --baseline flag
+func TestV6BaselineCreation(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	baselineDir := filepath.Join(tmpDir, "baselines")
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with --baseline flag with explicit name
+	cmd := exec.Command(binPath, "run", "--baseline", "default", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"ADMIT_BASELINE_DIR=" + baselineDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Failed to run with --baseline: %v\nOutput: %s", err, output)
+	}
+
+	// Verify baseline file was created
+	baselineFile := filepath.Join(baselineDir, "default.json")
+	if _, err := os.Stat(baselineFile); os.IsNotExist(err) {
+		t.Errorf("Baseline file not created at %s", baselineFile)
+	}
+}
+
+// TestV6BaselineWithName tests baseline creation with custom name
+func TestV6BaselineWithName(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	baselineDir := filepath.Join(tmpDir, "baselines")
+
+	// Run with --baseline production
+	cmd := exec.Command(binPath, "run", "--baseline", "production", "echo", "hello")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/prod",
+		"ADMIT_BASELINE_DIR=" + baselineDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Failed to run with --baseline production: %v\nOutput: %s", err, output)
+	}
+
+	// Verify baseline file was created with correct name
+	baselineFile := filepath.Join(baselineDir, "production.json")
+	if _, err := os.Stat(baselineFile); os.IsNotExist(err) {
+		t.Errorf("Baseline file not created at %s", baselineFile)
+	}
+}
+
+// TestV6DriftDetectionNoDrift tests drift detection with no changes
+func TestV6DriftDetectionNoDrift(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	baselineDir := filepath.Join(tmpDir, "baselines")
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+	env := []string{
+		"DB_URL=postgres://localhost/test",
+		"ADMIT_BASELINE_DIR=" + baselineDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	// First, create a baseline with explicit name
+	cmd := exec.Command(binPath, "run", "--baseline", "default", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = env
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to create baseline: %v\nOutput: %s", err, output)
+	}
+
+	// Run with --detect-drift with same config
+	cmd = exec.Command(binPath, "run", "--detect-drift", "default", "touch", markerFile+".2")
+	cmd.Dir = tmpDir
+	cmd.Env = env
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed to run with --detect-drift: %v", err)
+	}
+
+	// Should have no drift output
+	if bytes.Contains(stderr.Bytes(), []byte("drift")) {
+		t.Errorf("Expected no drift output, got: %s", stderr.String())
+	}
+}
+
+// TestV6DriftDetectionWithDrift tests drift detection with config changes
+func TestV6DriftDetectionWithDrift(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	baselineDir := filepath.Join(tmpDir, "baselines")
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// First, create a baseline with original config
+	cmd := exec.Command(binPath, "run", "--baseline", "default", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"ADMIT_BASELINE_DIR=" + baselineDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to create baseline: %v\nOutput: %s", err, output)
+	}
+
+	// Run with --detect-drift with DIFFERENT config
+	cmd = exec.Command(binPath, "run", "--detect-drift", "default", "touch", markerFile+".2")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/production", // Changed!
+		"ADMIT_BASELINE_DIR=" + baselineDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	// Should still succeed (drift doesn't block)
+	if err != nil {
+		t.Fatalf("Drift detection should not block execution: %v", err)
+	}
+
+	// Should have drift warning
+	if !bytes.Contains(stderr.Bytes(), []byte("drift")) {
+		t.Errorf("Expected drift warning, got: %s", stderr.String())
+	}
+}
+
+// TestV6DriftDetectionNoBaseline tests drift detection with no baseline (silent skip)
+func TestV6DriftDetectionNoBaseline(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	baselineDir := filepath.Join(tmpDir, "baselines")
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with --detect-drift but no baseline exists
+	cmd := exec.Command(binPath, "run", "--detect-drift", "default", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"ADMIT_BASELINE_DIR=" + baselineDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	// Should succeed silently
+	if err != nil {
+		t.Fatalf("Should succeed when no baseline exists: %v", err)
+	}
+
+	// Should have no error output
+	if bytes.Contains(stderr.Bytes(), []byte("Error")) {
+		t.Errorf("Expected no error, got: %s", stderr.String())
+	}
+}
+
+// TestV6BaselineList tests baseline list command
+func TestV6BaselineList(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	baselineDir := filepath.Join(tmpDir, "baselines")
+	env := []string{
+		"DB_URL=postgres://localhost/test",
+		"ADMIT_BASELINE_DIR=" + baselineDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	// Create a baseline
+	cmd := exec.Command(binPath, "run", "--baseline", "mybaseline", "echo", "hello")
+	cmd.Dir = tmpDir
+	cmd.Env = env
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to create baseline: %v\nOutput: %s", err, output)
+	}
+
+	// List baselines
+	cmd = exec.Command(binPath, "baseline", "list")
+	cmd.Env = []string{
+		"ADMIT_BASELINE_DIR=" + baselineDir,
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Failed to list baselines: %v\nOutput: %s", err, output)
+	}
+
+	if !bytes.Contains(output, []byte("mybaseline")) {
+		t.Errorf("Expected baseline 'mybaseline' in list, got: %s", output)
+	}
+}
+
+// TestV6BaselineShow tests baseline show command
+func TestV6BaselineShow(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	baselineDir := filepath.Join(tmpDir, "baselines")
+	env := []string{
+		"DB_URL=postgres://localhost/test",
+		"ADMIT_BASELINE_DIR=" + baselineDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	// Create a baseline
+	cmd := exec.Command(binPath, "run", "--baseline", "prod", "echo", "hello")
+	cmd.Dir = tmpDir
+	cmd.Env = env
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to create baseline: %v\nOutput: %s", err, output)
+	}
+
+	// Show baseline
+	cmd = exec.Command(binPath, "baseline", "show", "prod")
+	cmd.Env = []string{
+		"ADMIT_BASELINE_DIR=" + baselineDir,
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Failed to show baseline: %v\nOutput: %s", err, output)
+	}
+
+	if !bytes.Contains(output, []byte("prod")) {
+		t.Errorf("Expected baseline name 'prod' in output, got: %s", output)
+	}
+	if !bytes.Contains(output, []byte("db.url")) {
+		t.Errorf("Expected config key 'db.url' in output, got: %s", output)
+	}
+}
+
+// TestV6BaselineDelete tests baseline delete command
+func TestV6BaselineDelete(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	baselineDir := filepath.Join(tmpDir, "baselines")
+	env := []string{
+		"DB_URL=postgres://localhost/test",
+		"ADMIT_BASELINE_DIR=" + baselineDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	// Create a baseline
+	cmd := exec.Command(binPath, "run", "--baseline", "todelete", "echo", "hello")
+	cmd.Dir = tmpDir
+	cmd.Env = env
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to create baseline: %v\nOutput: %s", err, output)
+	}
+
+	// Delete baseline
+	cmd = exec.Command(binPath, "baseline", "delete", "todelete")
+	cmd.Env = []string{
+		"ADMIT_BASELINE_DIR=" + baselineDir,
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Failed to delete baseline: %v\nOutput: %s", err, output)
+	}
+
+	// Verify file is gone
+	baselineFile := filepath.Join(baselineDir, "todelete.json")
+	if _, err := os.Stat(baselineFile); !os.IsNotExist(err) {
+		t.Errorf("Baseline file should be deleted: %s", baselineFile)
+	}
+}
+
+// TestV6BaselineNotFound tests exit code 4 for missing baseline
+func TestV6BaselineNotFound(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	tmpDir, err := os.MkdirTemp("", "admit-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	baselineDir := filepath.Join(tmpDir, "baselines")
+
+	// Try to show non-existent baseline
+	cmd := exec.Command(binPath, "baseline", "show", "nonexistent")
+	cmd.Env = []string{
+		"ADMIT_BASELINE_DIR=" + baselineDir,
+	}
+
+	err = cmd.Run()
+	if err == nil {
+		t.Fatal("Expected error for non-existent baseline")
+	}
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("Expected ExitError, got %T", err)
+	}
+
+	if exitErr.ExitCode() != 4 {
+		t.Errorf("Expected exit code 4, got %d", exitErr.ExitCode())
+	}
+}
+
+// TestV6DriftJSON tests --drift-json output
+func TestV6DriftJSON(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	baselineDir := filepath.Join(tmpDir, "baselines")
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Create baseline with explicit name
+	cmd := exec.Command(binPath, "run", "--baseline", "default", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"ADMIT_BASELINE_DIR=" + baselineDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to create baseline: %v\nOutput: %s", err, output)
+	}
+
+	// Run with drift and --drift-json
+	cmd = exec.Command(binPath, "run", "--detect-drift", "default", "--drift-json", "touch", markerFile+".2")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/changed",
+		"ADMIT_BASELINE_DIR=" + baselineDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed to run with --drift-json: %v", err)
+	}
+
+	// Should have JSON output
+	if !bytes.Contains(stderr.Bytes(), []byte(`"hasDrift"`)) {
+		t.Errorf("Expected JSON drift output, got: %s", stderr.String())
+	}
+}
+
+// TestV6BackwardCompatibility tests that v5 behavior is preserved
+func TestV6BackwardCompatibility(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	// Run without any v6 flags
+	cmd := exec.Command(binPath, "run", "echo", "hello")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("v5 behavior should work: %v\nOutput: %s", err, output)
+	}
+
+	if !bytes.Contains(output, []byte("hello")) {
+		t.Errorf("Expected 'hello' in output, got: %s", output)
+	}
+}

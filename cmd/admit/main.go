@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"admit/internal/artifact"
+	"admit/internal/baseline"
 	"admit/internal/cli"
+	"admit/internal/drift"
 	"admit/internal/execid"
 	"admit/internal/identity"
 	"admit/internal/injector"
@@ -44,6 +46,11 @@ func run(args []string, environ []string, defaultSchemaDir string) int {
 
 	if cmd.Subcommand == cli.SubcommandReplay {
 		return runReplay(cmd, environ)
+	}
+
+	// Handle v6 baseline subcommand
+	if cmd.Subcommand == cli.SubcommandBaseline {
+		return runBaseline(cmd, environ)
 	}
 
 	// Resolve schema path
@@ -309,6 +316,60 @@ func run(args []string, environ []string, defaultSchemaDir string) int {
 			fmt.Fprintf(os.Stderr, "Error: cannot save snapshot: %v\n", err)
 			return 1
 		}
+	}
+
+	// Handle v6 baseline storage
+	if cmd.Baseline != "" {
+		schemaKeys := getSchemaKeys(s)
+		execID := execid.ComputeExecutionID(art.ConfigVersion, cmd.Target, cmd.Args, environ, schemaKeys)
+
+		// Build command string
+		cmdStr := cmd.Target
+		if len(cmd.Args) > 0 {
+			cmdStr = cmd.Target + " " + strings.Join(cmd.Args, " ")
+		}
+
+		b := baseline.Baseline{
+			Name:         cmd.Baseline,
+			ExecutionID:  execID.ExecutionID,
+			ConfigHash:   art.ConfigVersion,
+			ConfigValues: art.Values,
+			Command:      cmdStr,
+			Timestamp:    time.Now().UTC(),
+		}
+
+		store := baseline.NewStore(baseline.ResolveDir(environ))
+		if err := store.Save(b); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: cannot save baseline: %v\n", err)
+			return 1
+		}
+	}
+
+	// Handle v6 drift detection
+	if cmd.DetectDrift != "" {
+		store := baseline.NewStore(baseline.ResolveDir(environ))
+		b, err := store.Load(cmd.DetectDrift)
+		if err == nil {
+			// Baseline exists, perform drift detection
+			report := drift.Detect(b, art.Values, art.ConfigVersion)
+
+			if report.HasDrift {
+				// Output drift report (warnings only, never blocks)
+				if cmd.DriftJSON {
+					jsonOutput, err := drift.FormatJSON(report)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Error: cannot format drift report: %v\n", err)
+					} else {
+						fmt.Fprintln(os.Stderr, jsonOutput)
+					}
+				} else if ciMode {
+					fmt.Fprint(os.Stderr, drift.FormatCI(report))
+				} else {
+					fmt.Fprint(os.Stderr, drift.FormatCLI(report))
+				}
+			}
+		}
+		// If baseline not found, silently continue (no error)
 	}
 
 	// If valid: exec target command (silent success)
@@ -605,4 +666,87 @@ func runReplay(cmd cli.Command, environ []string) int {
 	}
 
 	return 0
+}
+
+
+// runBaseline handles the baseline subcommand.
+func runBaseline(cmd cli.Command, environ []string) int {
+	store := baseline.NewStore(baseline.ResolveDir(environ))
+
+	switch cmd.BaselineAction {
+	case "list":
+		summaries, err := store.List()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: cannot list baselines: %v\n", err)
+			return 1
+		}
+
+		if len(summaries) == 0 {
+			if cmd.JSONOutput {
+				fmt.Println("[]")
+			} else {
+				fmt.Println("No baselines found")
+			}
+			return 0
+		}
+
+		if cmd.JSONOutput {
+			data, err := json.MarshalIndent(summaries, "", "  ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: cannot serialize baselines: %v\n", err)
+				return 1
+			}
+			fmt.Println(string(data))
+		} else {
+			for _, b := range summaries {
+				fmt.Printf("%s  %s  %s  %s\n", b.Name, b.ConfigHash[:20]+"...", b.Command, b.Timestamp.Format(time.RFC3339))
+			}
+		}
+		return 0
+
+	case "show":
+		b, err := store.Load(cmd.BaselineName)
+		if err != nil {
+			if err == baseline.ErrBaselineNotFound {
+				fmt.Fprintf(os.Stderr, "Error: baseline not found: %s\n", cmd.BaselineName)
+				return 4
+			}
+			fmt.Fprintf(os.Stderr, "Error: cannot load baseline: %v\n", err)
+			return 1
+		}
+
+		if cmd.JSONOutput {
+			data, err := json.MarshalIndent(b, "", "  ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: cannot serialize baseline: %v\n", err)
+				return 1
+			}
+			fmt.Println(string(data))
+		} else {
+			fmt.Printf("Name:        %s\n", b.Name)
+			fmt.Printf("ConfigHash:  %s\n", b.ConfigHash)
+			fmt.Printf("ExecutionID: %s\n", b.ExecutionID)
+			fmt.Printf("Command:     %s\n", b.Command)
+			fmt.Printf("Timestamp:   %s\n", b.Timestamp.Format(time.RFC3339))
+			fmt.Println("Config Values:")
+			for k, v := range b.ConfigValues {
+				fmt.Printf("  %s: %s\n", k, v)
+			}
+		}
+		return 0
+
+	case "delete":
+		if err := store.Delete(cmd.BaselineName); err != nil {
+			if err == baseline.ErrBaselineNotFound {
+				fmt.Fprintf(os.Stderr, "Error: baseline not found: %s\n", cmd.BaselineName)
+				return 4
+			}
+			fmt.Fprintf(os.Stderr, "Error: cannot delete baseline: %v\n", err)
+			return 1
+		}
+		fmt.Printf("Deleted baseline: %s\n", cmd.BaselineName)
+		return 0
+	}
+
+	return 1
 }

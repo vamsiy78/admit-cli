@@ -22,6 +22,7 @@ const (
 	SubcommandCheck     Subcommand = "check"
 	SubcommandReplay    Subcommand = "replay"    // v5: replay an execution
 	SubcommandSnapshots Subcommand = "snapshots" // v5: list/manage snapshots
+	SubcommandBaseline  Subcommand = "baseline"  // v6: manage baselines
 )
 
 // Command represents the parsed CLI input
@@ -64,6 +65,13 @@ type Command struct {
 	ReplayID  string // execution ID for replay subcommand
 	PruneDays int    // --prune <days> (for snapshots)
 	DeleteID  string // --delete <execution_id> (for snapshots)
+
+	// v6 Drift Detection flags
+	Baseline       string // --baseline [name] (store baseline, default: "default")
+	DetectDrift    string // --detect-drift [name] (compare against baseline)
+	DriftJSON      bool   // --drift-json (output drift as JSON)
+	BaselineAction string // "list", "show", "delete" for baseline subcommand
+	BaselineName   string // name argument for baseline show/delete
 }
 
 // ParseArgs parses CLI arguments into a Command.
@@ -78,7 +86,7 @@ func ParseArgs(args []string) (Command, error) {
 	// First arg must be a valid subcommand
 	subcommand := args[0]
 	switch subcommand {
-	case "run", "check", "replay", "snapshots":
+	case "run", "check", "replay", "snapshots", "baseline":
 		// Valid subcommands
 	default:
 		return Command{}, ErrNoRunSubcommand
@@ -96,6 +104,11 @@ func ParseArgs(args []string) (Command, error) {
 	// Handle snapshots subcommand: admit snapshots [flags]
 	if subcommand == "snapshots" {
 		return parseSnapshotsArgs(args[1:], cmd)
+	}
+
+	// Handle baseline subcommand: admit baseline list|show|delete [name]
+	if subcommand == "baseline" {
+		return parseBaselineArgs(args[1:], cmd)
 	}
 
 	// Parse flags and find the command (for run/check)
@@ -174,6 +187,24 @@ func ParseArgs(args []string) (Command, error) {
 				cmd.ExecutionIDEnv = args[i]
 			case "snapshot":
 				cmd.Snapshot = true
+			case "baseline":
+				// --baseline [name] - optional name, default "default"
+				if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
+					i++
+					cmd.Baseline = args[i]
+				} else {
+					cmd.Baseline = "default"
+				}
+			case "detect-drift":
+				// --detect-drift [name] - optional name, default "default"
+				if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
+					i++
+					cmd.DetectDrift = args[i]
+				} else {
+					cmd.DetectDrift = "default"
+				}
+			case "drift-json":
+				cmd.DriftJSON = true
 			default:
 				// Unknown flag - treat as start of command
 				break
@@ -291,4 +322,46 @@ func parseInt(s string) (int, error) {
 		n = n*10 + int(c-'0')
 	}
 	return n, nil
+}
+
+
+// parseBaselineArgs parses arguments for the baseline subcommand.
+func parseBaselineArgs(args []string, cmd Command) (Command, error) {
+	if len(args) == 0 {
+		return Command{}, errors.New("baseline requires an action: usage: admit baseline <list|show|delete> [name]")
+	}
+
+	action := args[0]
+	switch action {
+	case "list":
+		cmd.BaselineAction = "list"
+		// Parse optional --json flag
+		for i := 1; i < len(args); i++ {
+			if args[i] == "--json" {
+				cmd.JSONOutput = true
+			}
+		}
+	case "show":
+		cmd.BaselineAction = "show"
+		if len(args) < 2 {
+			return Command{}, errors.New("baseline show requires a name: usage: admit baseline show <name>")
+		}
+		cmd.BaselineName = args[1]
+		// Parse optional --json flag
+		for i := 2; i < len(args); i++ {
+			if args[i] == "--json" {
+				cmd.JSONOutput = true
+			}
+		}
+	case "delete":
+		cmd.BaselineAction = "delete"
+		if len(args) < 2 {
+			return Command{}, errors.New("baseline delete requires a name: usage: admit baseline delete <name>")
+		}
+		cmd.BaselineName = args[1]
+	default:
+		return Command{}, errors.New("unknown baseline action: usage: admit baseline <list|show|delete> [name]")
+	}
+
+	return cmd, nil
 }

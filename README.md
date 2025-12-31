@@ -791,6 +791,203 @@ All v5 features are opt-in. Without new flags, admit behaves exactly as v4:
 admit run node server.js
 ```
 
+## V6 Features: Drift Detection
+
+V6 adds passive drift detection - compare current configuration against a known-good baseline and report differences as warnings. Drift detection is purely informational and never blocks execution.
+
+### Why Drift Detection?
+
+- **Configuration awareness**: Know when config has changed from a known-good state
+- **Gradual rollouts**: Detect unintended config changes during deployments
+- **Debugging aid**: Quickly identify what changed between working and broken states
+- **Non-blocking**: Warnings only - execution always proceeds
+
+### Baseline Storage
+
+Store a baseline during a successful execution:
+
+```bash
+# Store baseline with default name
+admit run --baseline default node server.js
+
+# Store baseline with custom name
+admit run --baseline production-2025-01 node server.js
+
+# Baselines are stored at ~/.admit/baselines/{name}.json
+# Or use ADMIT_BASELINE_DIR to customize location
+ADMIT_BASELINE_DIR=/var/log/admit/baselines admit run --baseline prod node server.js
+```
+
+Baseline content:
+```json
+{
+  "name": "production-2025-01",
+  "executionId": "sha256:a1b2c3d4...",
+  "configHash": "sha256:def456...",
+  "configValues": {
+    "db.url": "postgres://prod-db/app",
+    "payments.mode": "live"
+  },
+  "command": "node server.js",
+  "timestamp": "2025-01-15T10:30:00Z"
+}
+```
+
+### Drift Detection
+
+Compare current configuration against a stored baseline:
+
+```bash
+# Detect drift against default baseline
+admit run --detect-drift default node server.js
+
+# Detect drift against named baseline
+admit run --detect-drift production-2025-01 node server.js
+
+# If baseline doesn't exist, execution continues silently (no error)
+```
+
+When drift is detected, warnings are printed to stderr:
+
+```
+⚠ Configuration drift detected from baseline 'production-2025-01'
+  Baseline: sha256:def456... (2025-01-15T10:30:00Z)
+  Current:  sha256:789abc...
+
+  Changed keys:
+    db.url: postgres://prod-db/app → postgres://staging-db/app
+  
+  Added keys:
+    feature.new: enabled
+  
+  Removed keys:
+    legacy.flag
+```
+
+### JSON Drift Output
+
+Get drift report as JSON for programmatic processing:
+
+```bash
+admit run --detect-drift default --drift-json node server.js
+```
+
+Output:
+```json
+{
+  "hasDrift": true,
+  "baselineName": "default",
+  "baselineHash": "sha256:def456...",
+  "currentHash": "sha256:789abc...",
+  "baselineTime": "2025-01-15T10:30:00Z",
+  "changes": [
+    {
+      "key": "db.url",
+      "type": "changed",
+      "baselineValue": "postgres://prod-db/app",
+      "currentValue": "postgres://staging-db/app"
+    },
+    {
+      "key": "feature.new",
+      "type": "added",
+      "currentValue": "enabled"
+    },
+    {
+      "key": "legacy.flag",
+      "type": "removed",
+      "baselineValue": "true"
+    }
+  ]
+}
+```
+
+### CI Mode Drift Warnings
+
+In CI mode, drift warnings use GitHub Actions annotation format:
+
+```bash
+ADMIT_CI=true admit run --detect-drift default node server.js
+```
+
+Output:
+```
+::warning file=admit.yaml::Configuration drift detected: db.url changed from 'postgres://prod-db/app' to 'postgres://staging-db/app'
+::warning file=admit.yaml::Configuration drift detected: feature.new added with value 'enabled'
+::warning file=admit.yaml::Configuration drift detected: legacy.flag removed (was 'true')
+```
+
+### Baseline Management
+
+Manage stored baselines with the `baseline` subcommand:
+
+```bash
+# List all baselines
+admit baseline list
+# Output:
+# default           sha256:def456...  2025-01-15T10:30:00Z
+# production-2025-01  sha256:789abc...  2025-01-20T14:00:00Z
+
+# Show baseline details
+admit baseline show production-2025-01
+# Output:
+# Name: production-2025-01
+# Execution ID: sha256:a1b2c3d4...
+# Config Hash: sha256:789abc...
+# Command: node server.js
+# Timestamp: 2025-01-20T14:00:00Z
+# Config Values:
+#   db.url: postgres://prod-db/app
+#   payments.mode: live
+
+# Delete a baseline
+admit baseline delete production-2025-01
+```
+
+### Baseline Directory Configuration
+
+```bash
+# Default location
+~/.admit/baselines/
+
+# Custom location via environment variable
+ADMIT_BASELINE_DIR=/var/log/admit/baselines admit run --baseline prod node server.js
+
+# Baselines are stored as {name}.json
+```
+
+### Passive Drift Philosophy
+
+Drift detection is intentionally passive:
+
+- **Never blocks execution**: Even with drift, the command runs
+- **Warnings only**: Drift is reported to stderr as informational output
+- **Silent on missing baseline**: If baseline doesn't exist, no error - just no comparison
+- **No exit code impact**: Drift doesn't change the exit code
+
+This design supports gradual adoption and prevents drift detection from becoming a deployment blocker.
+
+### Combining with Other Features
+
+```bash
+# Store baseline and snapshot together
+admit run --baseline prod --snapshot node server.js
+
+# Detect drift with execution ID output
+admit run --detect-drift prod --execution-id node server.js
+
+# Full observability: baseline, drift detection, snapshot, and identity
+admit run --baseline prod --detect-drift prod --snapshot --execution-id-json node server.js
+```
+
+### Backward Compatibility
+
+All v6 features are opt-in. Without new flags, admit behaves exactly as v5:
+
+```bash
+# Standard v5 behavior - no baseline storage or drift detection
+admit run node server.js
+```
+
 ## Exit Codes
 
 | Code | Meaning |
@@ -799,7 +996,7 @@ admit run node server.js
 | 1 | Validation failed |
 | 2 | Invariant violation (v2+) |
 | 3 | Schema error (file not found, parse error) (v3+) |
-| 4 | Snapshot not found (v5+) |
+| 4 | Snapshot/baseline not found (v5+/v6+) |
 | 126 | Command found but permission denied |
 | 127 | Command not found |
 | N | Exit code from the executed command |
@@ -859,9 +1056,18 @@ admit/
 │   │   ├── artifact.go          # Config artifact generation
 │   │   ├── artifact_test.go     # Artifact property tests
 │   │   └── writer.go            # Artifact file writing
+│   ├── baseline/
+│   │   ├── types.go             # V6 baseline data structures
+│   │   ├── store.go             # Baseline storage operations
+│   │   └── store_test.go        # Store property tests
 │   ├── cli/
 │   │   ├── parser.go            # CLI argument parsing
 │   │   └── parser_test.go       # Argument preservation property tests
+│   ├── drift/
+│   │   ├── detector.go          # V6 drift detection logic
+│   │   ├── detector_test.go     # Detector property tests
+│   │   ├── reporter.go          # Drift report formatting
+│   │   └── reporter_test.go     # Reporter property tests
 │   ├── execid/
 │   │   ├── execid.go            # V4 execution identity generation
 │   │   └── execid_test.go       # Execution identity property tests
@@ -1132,6 +1338,20 @@ The implementation is validated by 48 property-based tests using [gopter](https:
 | 8 | Snapshot Cleanup | Req 5.1, 5.2 |
 | 9 | Snapshot Integrity Verification | Req 6.1, 6.2, 6.3, 6.4 |
 | 10 | Backward Compatibility | Req 7.1, 7.2, 7.3 |
+
+### V6 Properties (Drift Detection)
+
+| # | Property | Validates |
+|---|----------|-----------|
+| 1 | Baseline Round-Trip | Req 1.1, 1.2 |
+| 2 | Baseline Directory Configuration | Req 1.3, 1.4 |
+| 3 | Multiple Named Baselines | Req 1.5 |
+| 4 | No Drift When Hashes Match | Req 2.3 |
+| 5 | Drift Report Contains Key Differences | Req 2.4, 3.4, 3.5, 3.6, 3.7 |
+| 6 | Drift Never Blocks Execution | Req 2.5 |
+| 7 | Drift Report Formatting | Req 3.1, 3.2, 3.3 |
+| 8 | Baseline List and Delete | Req 4.1, 4.3 |
+| 9 | Backward Compatibility | Req 5.1, 5.3 |
 
 Each property test runs 100 iterations with randomly generated inputs.
 

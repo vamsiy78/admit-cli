@@ -1147,3 +1147,262 @@ func TestParseArgs_V5BackwardCompatibility_Property(t *testing.T) {
 
 	properties.TestingRun(t)
 }
+
+
+// TestParseArgs_V6BaselineSubcommand tests the baseline subcommand
+func TestParseArgs_V6BaselineSubcommand(t *testing.T) {
+	tests := []struct {
+		name           string
+		args           []string
+		wantSubcommand Subcommand
+		wantAction     string
+		wantName       string
+		wantJSON       bool
+		wantErr        bool
+	}{
+		{
+			name:           "baseline list",
+			args:           []string{"baseline", "list"},
+			wantSubcommand: SubcommandBaseline,
+			wantAction:     "list",
+		},
+		{
+			name:           "baseline list --json",
+			args:           []string{"baseline", "list", "--json"},
+			wantSubcommand: SubcommandBaseline,
+			wantAction:     "list",
+			wantJSON:       true,
+		},
+		{
+			name:           "baseline show",
+			args:           []string{"baseline", "show", "production"},
+			wantSubcommand: SubcommandBaseline,
+			wantAction:     "show",
+			wantName:       "production",
+		},
+		{
+			name:           "baseline show --json",
+			args:           []string{"baseline", "show", "production", "--json"},
+			wantSubcommand: SubcommandBaseline,
+			wantAction:     "show",
+			wantName:       "production",
+			wantJSON:       true,
+		},
+		{
+			name:           "baseline delete",
+			args:           []string{"baseline", "delete", "staging"},
+			wantSubcommand: SubcommandBaseline,
+			wantAction:     "delete",
+			wantName:       "staging",
+		},
+		{
+			name:    "baseline without action",
+			args:    []string{"baseline"},
+			wantErr: true,
+		},
+		{
+			name:    "baseline show without name",
+			args:    []string{"baseline", "show"},
+			wantErr: true,
+		},
+		{
+			name:    "baseline delete without name",
+			args:    []string{"baseline", "delete"},
+			wantErr: true,
+		},
+		{
+			name:    "baseline unknown action",
+			args:    []string{"baseline", "unknown"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, err := ParseArgs(tt.args)
+			if tt.wantErr {
+				if err == nil {
+					t.Error("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cmd.Subcommand != tt.wantSubcommand {
+				t.Errorf("Subcommand = %q, want %q", cmd.Subcommand, tt.wantSubcommand)
+			}
+			if cmd.BaselineAction != tt.wantAction {
+				t.Errorf("BaselineAction = %q, want %q", cmd.BaselineAction, tt.wantAction)
+			}
+			if cmd.BaselineName != tt.wantName {
+				t.Errorf("BaselineName = %q, want %q", cmd.BaselineName, tt.wantName)
+			}
+			if cmd.JSONOutput != tt.wantJSON {
+				t.Errorf("JSONOutput = %v, want %v", cmd.JSONOutput, tt.wantJSON)
+			}
+		})
+	}
+}
+
+// TestParseArgs_V6DriftFlags tests the v6 drift detection flags
+func TestParseArgs_V6DriftFlags(t *testing.T) {
+	tests := []struct {
+		name            string
+		args            []string
+		wantTarget      string
+		wantBaseline    string
+		wantDetectDrift string
+		wantDriftJSON   bool
+	}{
+		{
+			name:         "run with --baseline name",
+			args:         []string{"run", "--baseline", "production", "echo"},
+			wantTarget:   "echo",
+			wantBaseline: "production",
+		},
+		{
+			name:         "run with --baseline default",
+			args:         []string{"run", "--baseline", "default", "echo"},
+			wantTarget:   "echo",
+			wantBaseline: "default",
+		},
+		{
+			name:            "run with --detect-drift name",
+			args:            []string{"run", "--detect-drift", "production", "echo"},
+			wantTarget:      "echo",
+			wantDetectDrift: "production",
+		},
+		{
+			name:            "run with --detect-drift default",
+			args:            []string{"run", "--detect-drift", "default", "echo"},
+			wantTarget:      "echo",
+			wantDetectDrift: "default",
+		},
+		{
+			name:            "run with --drift-json",
+			args:            []string{"run", "--detect-drift", "default", "--drift-json", "echo"},
+			wantTarget:      "echo",
+			wantDetectDrift: "default",
+			wantDriftJSON:   true,
+		},
+		{
+			name:            "run with all drift flags",
+			args:            []string{"run", "--baseline", "prod", "--detect-drift", "prod", "--drift-json", "node", "app.js"},
+			wantTarget:      "node",
+			wantBaseline:    "prod",
+			wantDetectDrift: "prod",
+			wantDriftJSON:   true,
+		},
+		{
+			name:       "run without drift flags",
+			args:       []string{"run", "echo"},
+			wantTarget: "echo",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, err := ParseArgs(tt.args)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cmd.Target != tt.wantTarget {
+				t.Errorf("Target = %q, want %q", cmd.Target, tt.wantTarget)
+			}
+			if cmd.Baseline != tt.wantBaseline {
+				t.Errorf("Baseline = %q, want %q", cmd.Baseline, tt.wantBaseline)
+			}
+			if cmd.DetectDrift != tt.wantDetectDrift {
+				t.Errorf("DetectDrift = %q, want %q", cmd.DetectDrift, tt.wantDetectDrift)
+			}
+			if cmd.DriftJSON != tt.wantDriftJSON {
+				t.Errorf("DriftJSON = %v, want %v", cmd.DriftJSON, tt.wantDriftJSON)
+			}
+		})
+	}
+}
+
+// Feature: admit-v6-drift-detection, Property 10: Backward Compatibility
+// Validates: Requirements 5.1, 5.3
+// For any v5-compatible invocation (no v6 flags), behavior SHALL be identical to v5.
+func TestParseArgs_V6BackwardCompatibility_Property(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	// Property: v5 invocations still work
+	properties.Property("v5 invocations parse correctly without v6 flags set", prop.ForAll(
+		func(target string, args []string) bool {
+			if target == "" {
+				return true // Skip empty targets
+			}
+			// Build v5-style args: ["run", target, arg1, arg2, ...]
+			inputArgs := append([]string{"run", target}, args...)
+			cmd, err := ParseArgs(inputArgs)
+			if err != nil {
+				return false
+			}
+			// Verify subcommand is run
+			if cmd.Subcommand != SubcommandRun {
+				return false
+			}
+			// Verify target is preserved
+			if cmd.Target != target {
+				return false
+			}
+			// Verify args are preserved
+			if len(cmd.Args) != len(args) {
+				return false
+			}
+			for i, arg := range args {
+				if cmd.Args[i] != arg {
+					return false
+				}
+			}
+			// Verify v6 flags are not set
+			if cmd.Baseline != "" || cmd.DetectDrift != "" || cmd.DriftJSON {
+				return false
+			}
+			return true
+		},
+		gen.Identifier(),
+		gen.SliceOf(gen.AlphaString()),
+	))
+
+	// Property: v5 snapshot flag still works
+	properties.Property("v5 snapshot flag still works", prop.ForAll(
+		func(target string) bool {
+			if target == "" {
+				return true
+			}
+			args := []string{"run", "--snapshot", target}
+			cmd, err := ParseArgs(args)
+			if err != nil {
+				return false
+			}
+			return cmd.Target == target && cmd.Snapshot
+		},
+		gen.Identifier(),
+	))
+
+	// Property: v5 and v6 flags can coexist
+	properties.Property("v5 and v6 flags can coexist", prop.ForAll(
+		func(target string) bool {
+			if target == "" {
+				return true
+			}
+			// Use explicit baseline names since --baseline and --detect-drift consume the next arg
+			args := []string{"run", "--snapshot", "--baseline", "default", "--detect-drift", "default", target}
+			cmd, err := ParseArgs(args)
+			if err != nil {
+				return false
+			}
+			return cmd.Target == target && cmd.Snapshot && cmd.Baseline == "default" && cmd.DetectDrift == "default"
+		},
+		gen.Identifier(),
+	))
+
+	properties.TestingRun(t)
+}
