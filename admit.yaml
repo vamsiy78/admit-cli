@@ -2,17 +2,81 @@
 # This file declares configuration requirements that must be satisfied
 # before the target command can execute.
 
+# =============================================================================
+# V0: Config Schema - Define configuration keys, types, and constraints
+# =============================================================================
 config:
   db.url:
     type: string
     required: true
 
+  db.env:
+    type: enum
+    values: [dev, staging, prod]
+    required: true
+
   payments.mode:
     type: enum
-    values: [test, live]
+    values: [sandbox, test, live]
     required: true
 
   log.level:
     type: enum
     values: [debug, info, warn, error]
     required: false
+
+  debug.enabled:
+    type: enum
+    values: [true, false]
+    required: false
+
+# =============================================================================
+# V2: Invariants - Cross-configuration constraints enforced at runtime
+# Uses ADMIT_ENV environment variable for execution.env
+# =============================================================================
+invariants:
+  # Prevent production database in non-production environments
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.env == "prod"
+
+  # Prevent live payments in non-production environments  
+  - name: payments-guard
+    rule: execution.env != "prod" => payments.mode != "live"
+
+  # Prevent debug mode in production
+  - name: debug-guard
+    rule: execution.env == "prod" => debug.enabled != "true"
+
+  # Ensure staging uses staging database
+  - name: staging-isolation
+    rule: execution.env == "staging" => db.env == "staging"
+
+# =============================================================================
+# V7: Environment Contracts - Declarative pre-execution gates
+# Hard enforcement: violations block execution with exit code 5
+# =============================================================================
+environments:
+  prod:
+    allow:
+      payments.mode: live
+      db.env: prod
+    deny:
+      db.url: "*-staging*"
+      db.url: "*-dev*"
+      debug.enabled: "true"
+      log.level: debug
+
+  staging:
+    allow:
+      payments.mode: [sandbox, test]
+      db.env: staging
+    deny:
+      payments.mode: live
+      db.url: "*-prod*"
+
+  dev:
+    allow:
+      db.env: dev
+    deny:
+      payments.mode: live
+      db.url: "*-prod*"

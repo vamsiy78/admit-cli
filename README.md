@@ -70,12 +70,49 @@ Admit is a launcher primitive that owns the execve boundary. It reads a schema f
 
 ## Installation
 
-```bash
-# Build from source
-go build -o admit ./cmd/admit
+### From Source (requires Go 1.21+)
 
-# Or use make
+```bash
+# Clone and build
+git clone https://github.com/vamsiy78/admit-cli.git
+cd admit-cli
 make build
+
+# Install to PATH
+sudo mv admit /usr/local/bin/
+```
+
+### Using Go Install
+
+```bash
+go install github.com/vamsiy78/admit-cli/cmd/admit@latest
+```
+
+### Cross-Compile for Other Platforms
+
+```bash
+# Linux (amd64)
+GOOS=linux GOARCH=amd64 go build -o admit-linux-amd64 ./cmd/admit
+
+# Linux (arm64)
+GOOS=linux GOARCH=arm64 go build -o admit-linux-arm64 ./cmd/admit
+
+# Windows
+GOOS=windows GOARCH=amd64 go build -o admit.exe ./cmd/admit
+
+# macOS (Intel)
+GOOS=darwin GOARCH=amd64 go build -o admit-darwin-amd64 ./cmd/admit
+
+# macOS (Apple Silicon)
+GOOS=darwin GOARCH=arm64 go build -o admit-darwin-arm64 ./cmd/admit
+```
+
+### Verify Installation
+
+```bash
+admit --help
+# or
+admit check --help
 ```
 
 ## Quick Start
@@ -88,33 +125,67 @@ config:
     type: string
     required: true
 
+  db.env:
+    type: enum
+    values: [dev, staging, prod]
+    required: true
+
   payments.mode:
     type: enum
-    values: [test, live]
+    values: [sandbox, test, live]
     required: true
 
   log.level:
     type: enum
     values: [debug, info, warn, error]
     required: false
+
+# V2: Runtime invariants (optional)
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.env == "prod"
+  - name: payments-guard
+    rule: execution.env != "prod" => payments.mode != "live"
+
+# V7: Environment contracts (optional)
+environments:
+  prod:
+    allow:
+      payments.mode: live
+      db.env: prod
+    deny:
+      db.url: "*-staging*"
+  staging:
+    allow:
+      payments.mode: [sandbox, test]
+    deny:
+      payments.mode: live
 ```
 
 2. Run your application through admit:
 
 ```bash
 # With valid config - command executes silently
-DB_URL="postgres://localhost/mydb" PAYMENTS_MODE="test" admit run node index.js
+DB_URL="postgres://localhost/mydb" DB_ENV="dev" PAYMENTS_MODE="test" admit run node index.js
 
 # With missing required config - blocked with clear errors
 admit run node index.js
 # Output:
 # db.url: required but DB_URL is not set
+# db.env: required but DB_ENV is not set
 # payments.mode: required but PAYMENTS_MODE is not set
 
 # With invalid enum value - blocked with allowed values listed
-DB_URL="postgres://localhost/mydb" PAYMENTS_MODE="invalid" admit run node index.js
+DB_URL="postgres://localhost/mydb" DB_ENV="dev" PAYMENTS_MODE="invalid" admit run node index.js
 # Output:
-# payments.mode: 'invalid' is not valid, must be one of: test, live
+# payments.mode: 'invalid' is not valid, must be one of: sandbox, test, live
+
+# With environment contract enforcement (v7)
+DB_URL="postgres://staging-db/app" DB_ENV="prod" PAYMENTS_MODE="live" admit run --env prod node index.js
+# Output:
+# CONTRACT VIOLATION in environment 'prod':
+#   db.url: 'postgres://staging-db/app' matches denied pattern '*-staging*'
+# Exit code: 5
 ```
 
 ## Schema Format
@@ -988,6 +1059,191 @@ All v6 features are opt-in. Without new flags, admit behaves exactly as v5:
 admit run node server.js
 ```
 
+## V7 Features: Environment Contracts
+
+V7 adds environment contracts - declarative pre-execution gates that enforce what configuration states are allowed in each environment. Unlike drift detection (informational warnings), contracts are hard enforcement: violations block execution entirely.
+
+### Why Environment Contracts?
+
+Environment contracts answer: "Should this execution exist at all?" - not "What behavior should happen?"
+
+**Real outages v7 eliminates:**
+- Prod pointing to staging DB
+- Debug mode enabled in production
+- Test payment modes live in prod
+- Accidental feature exposure
+- Compliance violations
+
+These are not bugs. They are invalid states that should never execute.
+
+### Defining Contracts
+
+Add an `environments` section to your `admit.yaml`:
+
+```yaml
+config:
+  db.url:
+    type: string
+    required: true
+  payments.mode:
+    type: enum
+    values: [live, test, sandbox]
+    required: true
+  db.ssl:
+    type: enum
+    values: [true, false]
+    required: true
+  debug.enabled:
+    type: enum
+    values: [true, false]
+    required: false
+
+environments:
+  prod:
+    allow:
+      payments.mode: live
+      db.ssl: true
+    deny:
+      db.url: "*-staging*"
+      debug.enabled: true
+  
+  staging:
+    allow:
+      payments.mode: [test, sandbox]
+    deny:
+      payments.mode: live
+  
+  dev:
+    # No restrictions - anything goes
+```
+
+### Contract Rules
+
+**Allow rules**: Specify exact values that are permitted
+```yaml
+allow:
+  payments.mode: live           # Single value
+  db.ssl: true
+  region: [us-east-1, us-west-2]  # Multiple values
+```
+
+**Deny rules**: Specify patterns that are forbidden (supports glob `*` wildcard)
+```yaml
+deny:
+  db.url: "*-staging*"          # Glob pattern
+  debug.enabled: true           # Exact match
+  api.key: ["test-*", "dev-*"]  # Multiple patterns
+```
+
+**Precedence**: Deny rules always take precedence over allow rules.
+
+### Environment Selection
+
+Specify the environment via flag or environment variable:
+
+```bash
+# Via --env flag (highest priority)
+admit run --env prod node server.js
+
+# Via ADMIT_ENV environment variable
+ADMIT_ENV=prod admit run node server.js
+
+# Flag takes precedence over env var
+ADMIT_ENV=staging admit run --env prod node server.js  # Uses prod
+```
+
+### Contract Violations
+
+When a contract is violated, admit blocks execution and reports all violations:
+
+```bash
+ADMIT_ENV=prod DB_URL="postgres://staging-db/app" PAYMENTS_MODE="test" admit run node server.js
+# Output:
+# CONTRACT VIOLATION in environment 'prod':
+#   payments.mode: 'test' is not allowed (expected: live)
+#   db.url: 'postgres://staging-db/app' matches denied pattern '*-staging*'
+#
+# Exit code: 5
+```
+
+### JSON Output
+
+Get contract violations as JSON:
+
+```bash
+admit run --env prod --contract-json node server.js
+```
+
+Output:
+```json
+{
+  "environment": "prod",
+  "passed": false,
+  "violations": [
+    {
+      "key": "payments.mode",
+      "actualValue": "test",
+      "ruleType": "allow",
+      "expectedValues": ["live"]
+    },
+    {
+      "key": "db.url",
+      "actualValue": "postgres://staging-db/app",
+      "ruleType": "deny",
+      "pattern": "*-staging*"
+    }
+  ]
+}
+```
+
+### CI Mode
+
+In CI mode, contract violations use GitHub Actions annotation format:
+
+```bash
+ADMIT_CI=true admit run --env prod node server.js
+```
+
+Output:
+```
+::error file=admit.yaml::CONTRACT VIOLATION: payments.mode 'test' not in allowed values [live]
+::error file=admit.yaml::CONTRACT VIOLATION: db.url 'postgres://staging-db/app' matches denied pattern '*-staging*'
+```
+
+### Unmentioned Keys
+
+Keys not mentioned in the contract are permitted with any value:
+
+```yaml
+environments:
+  prod:
+    allow:
+      payments.mode: live  # Only payments.mode is constrained
+    # db.url, log.level, etc. can have any value
+```
+
+### Combining with Other Features
+
+```bash
+# Contract enforcement with drift detection
+admit run --env prod --detect-drift prod node server.js
+
+# Contract enforcement with snapshot
+admit run --env prod --snapshot node server.js
+
+# Full observability
+admit run --env prod --baseline prod --snapshot --execution-id-json node server.js
+```
+
+### Backward Compatibility
+
+All v7 features are opt-in. Without `--env` flag or `ADMIT_ENV`, admit behaves exactly as v6:
+
+```bash
+# Standard v6 behavior - no contract evaluation
+admit run node server.js
+```
+
 ## Exit Codes
 
 | Code | Meaning |
@@ -997,6 +1253,7 @@ admit run node server.js
 | 2 | Invariant violation (v2+) |
 | 3 | Schema error (file not found, parse error) (v3+) |
 | 4 | Snapshot/baseline not found (v5+/v6+) |
+| 5 | Contract violation (v7+) |
 | 126 | Command found but permission denied |
 | 127 | Command not found |
 | N | Exit code from the executed command |
@@ -1063,6 +1320,12 @@ admit/
 │   ├── cli/
 │   │   ├── parser.go            # CLI argument parsing
 │   │   └── parser_test.go       # Argument preservation property tests
+│   ├── contract/
+│   │   ├── types.go             # V7 contract data structures
+│   │   ├── evaluator.go         # Contract evaluation logic
+│   │   ├── evaluator_test.go    # Evaluator property tests
+│   │   ├── reporter.go          # Violation message formatting
+│   │   └── reporter_test.go     # Reporter property tests
 │   ├── drift/
 │   │   ├── detector.go          # V6 drift detection logic
 │   │   ├── detector_test.go     # Detector property tests
@@ -1352,6 +1615,24 @@ The implementation is validated by 48 property-based tests using [gopter](https:
 | 7 | Drift Report Formatting | Req 3.1, 3.2, 3.3 |
 | 8 | Baseline List and Delete | Req 4.1, 4.3 |
 | 9 | Backward Compatibility | Req 5.1, 5.3 |
+
+### V7 Properties (Environment Contracts)
+
+| # | Property | Validates |
+|---|----------|-----------|
+| 1 | Contract Parsing Round-Trip | Req 1.1, 1.2, 1.3, 1.4 |
+| 2 | Allow Rule Violation Detection | Req 2.2 |
+| 3 | Deny Rule Violation Detection | Req 2.3 |
+| 4 | Deny Precedence Over Allow | Req 2.4 |
+| 5 | Unmentioned Keys Pass | Req 2.5 |
+| 6 | Glob Pattern Matching | Req 5.1, 5.2, 5.3 |
+| 7 | Allow Rules Exact Match Only | Req 5.4 |
+| 8 | Environment Selection Precedence | Req 4.1, 4.2, 4.3 |
+| 9 | All Violations Reported | Req 3.6 |
+| 10 | CLI Output Contains Required Fields | Req 3.3 |
+| 11 | CI Output Format | Req 3.4 |
+| 12 | JSON Output Validity | Req 3.5 |
+| 13 | Backward Compatibility | Req 6.1, 6.2, 6.3 |
 
 Each property test runs 100 iterations with randomly generated inputs.
 
