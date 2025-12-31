@@ -144,13 +144,17 @@ func (s Schema) ToYAML() ([]byte, error) {
 // LoadSchema reads and parses admit.yaml from the given directory
 func LoadSchema(dir string) (Schema, error) {
 	path := filepath.Join(dir, "admit.yaml")
+	return LoadSchemaFromPath(path)
+}
 
+// LoadSchemaFromPath reads and parses a schema from the given file path
+func LoadSchemaFromPath(path string) (Schema, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return Schema{}, fmt.Errorf("no admit.yaml found in %s", dir)
+			return Schema{}, err
 		}
-		return Schema{}, fmt.Errorf("failed to read admit.yaml: %w", err)
+		return Schema{}, fmt.Errorf("failed to read schema: %w", err)
 	}
 
 	return ParseSchema(content)

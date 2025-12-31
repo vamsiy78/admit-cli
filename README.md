@@ -331,13 +331,188 @@ Invariants are opt-in. Schemas without an `invariants` section work exactly as b
 admit run node server.js
 ```
 
+## V3 Features: Container & CI Enforcement
+
+V3 adds features for container health checks, CI pipeline integration, and flexible schema location.
+
+### Check Subcommand
+
+Validate configuration without executing any command:
+
+```bash
+# Basic check - validates config and exits
+admit check
+
+# Check with JSON output
+admit check --json
+```
+
+Output:
+```json
+{
+  "valid": true,
+  "validationErrors": [],
+  "invariantResults": [],
+  "schemaPath": "/app/admit.yaml"
+}
+```
+
+Use `admit check` for:
+- Container health checks (Kubernetes liveness/readiness probes)
+- Pre-flight validation in CI pipelines
+- Configuration testing without side effects
+
+### Schema Path Flexibility
+
+Specify schema location via flag or environment variable:
+
+```bash
+# Via --schema flag (highest priority)
+admit check --schema /etc/admit/schema.yaml
+admit run --schema ./config/admit.yaml node server.js
+
+# Via ADMIT_SCHEMA environment variable
+ADMIT_SCHEMA=/etc/admit/schema.yaml admit check
+
+# Default: admit.yaml in current directory
+admit check
+```
+
+Priority order:
+1. `--schema` flag
+2. `ADMIT_SCHEMA` environment variable
+3. `admit.yaml` in current directory
+
+### Dry-Run Mode
+
+Validate configuration and see what would execute without actually running:
+
+```bash
+# Basic dry-run
+admit run --dry-run node server.js
+# Output: Config valid, would execute: node server.js
+
+# Dry-run with JSON output
+admit run --dry-run --json node server.js
+```
+
+JSON output:
+```json
+{
+  "valid": true,
+  "command": "node",
+  "args": ["server.js"],
+  "schemaPath": "/app/admit.yaml"
+}
+```
+
+### CI Mode
+
+Output validation errors in GitHub Actions annotation format:
+
+```bash
+# Via --ci flag
+admit run --ci node server.js
+
+# Via ADMIT_CI environment variable
+ADMIT_CI=true admit run node server.js
+
+# Also detects standard CI=true environment variable
+CI=true admit run node server.js
+```
+
+CI mode output for validation errors:
+```
+::error file=admit.yaml::db.url: required but DB_URL is not set
+::error file=admit.yaml::payments.mode: required but PAYMENTS_MODE is not set
+
+❌ Validation failed: 2 error(s)
+```
+
+CI mode output for invariant violations:
+```
+::error file=admit.yaml::INVARIANT VIOLATION: 'prod-db-guard' - condition 'execution.env == "prod"' is true but 'db.url.env == "prod"' is false
+
+❌ Invariant check failed: 1 violation(s)
+```
+
+### Container Integration Examples
+
+#### Docker ENTRYPOINT
+
+```dockerfile
+FROM node:20-alpine
+
+COPY admit /usr/local/bin/admit
+COPY admit.yaml /app/admit.yaml
+COPY . /app
+
+WORKDIR /app
+
+# Use admit as entrypoint
+ENTRYPOINT ["admit", "run"]
+CMD ["node", "server.js"]
+```
+
+#### Kubernetes Health Checks
+
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: app
+    image: myapp:latest
+    livenessProbe:
+      exec:
+        command: ["admit", "check"]
+      initialDelaySeconds: 5
+      periodSeconds: 10
+    readinessProbe:
+      exec:
+        command: ["admit", "check"]
+      initialDelaySeconds: 5
+      periodSeconds: 5
+```
+
+#### CI Pipeline Example (GitHub Actions)
+
+```yaml
+name: Deploy
+on: [push]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Validate config
+        run: |
+          admit check --ci --schema ./config/admit.yaml
+        env:
+          DB_URL: ${{ secrets.DB_URL }}
+          PAYMENTS_MODE: ${{ vars.PAYMENTS_MODE }}
+          ADMIT_ENV: production
+```
+
+### Backward Compatibility
+
+All v3 features are opt-in. Without new flags, admit behaves exactly as v2:
+
+```bash
+# Standard v2 behavior - validation, invariants, then exec
+admit run node server.js
+```
+
 ## Exit Codes
 
 | Code | Meaning |
 |------|---------|
 | 0 | Validation passed, command executed successfully |
-| 1 | Validation failed or schema error |
-| 2 | Invariant violation (v2) |
+| 1 | Validation failed |
+| 2 | Invariant violation (v2+) |
+| 3 | Schema error (file not found, parse error) (v3+) |
 | 126 | Command found but permission denied |
 | 127 | Command not found |
 | N | Exit code from the executed command |
@@ -618,6 +793,19 @@ The implementation is validated by 38 property-based tests using [gopter](https:
 | 9 | Violation Output Completeness | Req 4.3-4.5, 5.1-5.3 |
 | 10 | JSON Output Format | Req 5.5 |
 | 11 | Backward Compatibility - No Invariants | Req 6.1, 6.4 |
+
+### V3 Properties (Container & CI Enforcement)
+
+| # | Property | Validates |
+|---|----------|-----------|
+| 1 | Check Validation Equivalence | Req 3.1-3.4 |
+| 2 | Schema Path Resolution | Req 2.4, 2.5, 5.1-5.4 |
+| 3 | Missing Schema Error | Req 5.5 |
+| 4 | Dry Run Non-Execution | Req 6.1-6.4 |
+| 5 | CI Annotation Format Compliance | Req 4.2, 4.3, 4.5 |
+| 6 | Exit Code Consistency | Req 3.2-3.4, 7.4 |
+| 7 | Backward Compatibility | Req 7.1-7.3 |
+| 8 | Check JSON Output Structure | Req 3.5 |
 
 Each property test runs 100 iterations with randomly generated inputs.
 

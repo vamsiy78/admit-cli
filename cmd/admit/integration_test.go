@@ -1548,3 +1548,578 @@ invariants:
 		t.Errorf("Should not see invariant violation when v1 validation fails first")
 	}
 }
+
+
+// ============================================================================
+// V3 Integration Tests - Container & CI Enforcement
+// ============================================================================
+
+// TestCheckSubcommandValidConfig tests that `admit check` returns 0 for valid config
+func TestCheckSubcommandValidConfig(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	cmd := exec.Command(binPath, "check")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Errorf("Expected check to succeed with valid config, got error: %v", err)
+	}
+
+	// Should output success message
+	if !bytes.Contains(stdout.Bytes(), []byte("Config valid")) {
+		t.Errorf("Expected 'Config valid' in output, got: %s", stdout.String())
+	}
+}
+
+// TestCheckSubcommandInvalidConfig tests that `admit check` returns 1 for invalid config
+func TestCheckSubcommandInvalidConfig(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	cmd := exec.Command(binPath, "check")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		// Missing DB_URL
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Errorf("Expected check to fail with invalid config")
+	}
+
+	// Check exit code is 1
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 1 {
+			t.Errorf("Expected exit code 1 for validation error, got %d", exitErr.ExitCode())
+		}
+	}
+}
+
+// TestCheckSubcommandInvariantViolation tests that `admit check` returns 2 for invariant violation
+func TestCheckSubcommandInvariantViolation(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url.env:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	cmd := exec.Command(binPath, "check")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=prod",
+		"DB_URL_ENV=staging", // Mismatch - invariant fails
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Errorf("Expected check to fail with invariant violation")
+	}
+
+	// Check exit code is 2
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 2 {
+			t.Errorf("Expected exit code 2 for invariant violation, got %d", exitErr.ExitCode())
+		}
+	}
+}
+
+// TestCheckJSONOutput tests that `admit check --json` outputs valid JSON
+func TestCheckJSONOutput(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	cmd := exec.Command(binPath, "check", "--json")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Errorf("Expected check --json to succeed, got error: %v", err)
+	}
+
+	output := stdout.String()
+	if !bytes.Contains([]byte(output), []byte(`"valid":true`)) {
+		t.Errorf("Expected 'valid:true' in JSON output, got: %s", output)
+	}
+	if !bytes.Contains([]byte(output), []byte(`"validationErrors"`)) {
+		t.Errorf("Expected 'validationErrors' in JSON output, got: %s", output)
+	}
+	if !bytes.Contains([]byte(output), []byte(`"schemaPath"`)) {
+		t.Errorf("Expected 'schemaPath' in JSON output, got: %s", output)
+	}
+}
+
+// TestSchemaFlag tests that --schema flag overrides default schema path
+func TestSchemaFlag(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	tmpDir, err := os.MkdirTemp("", "admit-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create custom schema at non-default path
+	customSchemaPath := filepath.Join(tmpDir, "custom-schema.yaml")
+	schemaContent := `config:
+  custom.key:
+    type: string
+    required: true
+`
+	if err := os.WriteFile(customSchemaPath, []byte(schemaContent), 0644); err != nil {
+		t.Fatalf("Failed to write schema: %v", err)
+	}
+
+	cmd := exec.Command(binPath, "check", "--schema", customSchemaPath)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"CUSTOM_KEY=value",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err = cmd.Run()
+	if err != nil {
+		t.Errorf("Expected check with --schema to succeed, got error: %v", err)
+	}
+}
+
+// TestAdmitSchemaEnvVar tests that ADMIT_SCHEMA env var sets schema path
+func TestAdmitSchemaEnvVar(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	tmpDir, err := os.MkdirTemp("", "admit-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create custom schema at non-default path
+	customSchemaPath := filepath.Join(tmpDir, "env-schema.yaml")
+	schemaContent := `config:
+  env.key:
+    type: string
+    required: true
+`
+	if err := os.WriteFile(customSchemaPath, []byte(schemaContent), 0644); err != nil {
+		t.Fatalf("Failed to write schema: %v", err)
+	}
+
+	cmd := exec.Command(binPath, "check")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_SCHEMA=" + customSchemaPath,
+		"ENV_KEY=value",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err = cmd.Run()
+	if err != nil {
+		t.Errorf("Expected check with ADMIT_SCHEMA to succeed, got error: %v", err)
+	}
+}
+
+// TestDryRunValidConfig tests that --dry-run outputs success message without executing
+func TestDryRunValidConfig(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	cmd := exec.Command(binPath, "run", "--dry-run", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Errorf("Expected dry-run to succeed, got error: %v", err)
+	}
+
+	// Should output success message
+	if !bytes.Contains(stdout.Bytes(), []byte("Config valid")) {
+		t.Errorf("Expected 'Config valid' in output, got: %s", stdout.String())
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte("would execute")) {
+		t.Errorf("Expected 'would execute' in output, got: %s", stdout.String())
+	}
+
+	// Marker file should NOT exist (command was not executed)
+	if _, err := os.Stat(markerFile); err == nil {
+		t.Errorf("Marker file should not exist in dry-run mode")
+	}
+}
+
+// TestDryRunInvalidConfig tests that --dry-run outputs errors for invalid config
+func TestDryRunInvalidConfig(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	cmd := exec.Command(binPath, "run", "--dry-run", "echo", "hello")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		// Missing DB_URL
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Errorf("Expected dry-run to fail with invalid config")
+	}
+
+	// Check exit code is 1
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 1 {
+			t.Errorf("Expected exit code 1 for validation error, got %d", exitErr.ExitCode())
+		}
+	}
+}
+
+// TestDryRunJSONOutput tests that --dry-run --json outputs valid JSON
+func TestDryRunJSONOutput(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	cmd := exec.Command(binPath, "run", "--dry-run", "--json", "echo", "hello", "world")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Errorf("Expected dry-run --json to succeed, got error: %v", err)
+	}
+
+	output := stdout.String()
+	if !bytes.Contains([]byte(output), []byte(`"valid":true`)) {
+		t.Errorf("Expected 'valid:true' in JSON output, got: %s", output)
+	}
+	if !bytes.Contains([]byte(output), []byte(`"command":"echo"`)) {
+		t.Errorf("Expected 'command:echo' in JSON output, got: %s", output)
+	}
+	if !bytes.Contains([]byte(output), []byte(`"args"`)) {
+		t.Errorf("Expected 'args' in JSON output, got: %s", output)
+	}
+}
+
+// TestCIModeValidationError tests that --ci outputs GitHub Actions annotations for validation errors
+func TestCIModeValidationError(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	cmd := exec.Command(binPath, "run", "--ci", "echo", "hello")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		// Missing DB_URL
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Errorf("Expected CI mode to fail with invalid config")
+	}
+
+	// Should contain GitHub Actions annotation format
+	stderrStr := stderr.String()
+	if !bytes.Contains([]byte(stderrStr), []byte("::error file=admit.yaml::")) {
+		t.Errorf("Expected GitHub Actions annotation format, got: %s", stderrStr)
+	}
+	if !bytes.Contains([]byte(stderrStr), []byte("Validation failed")) {
+		t.Errorf("Expected 'Validation failed' summary, got: %s", stderrStr)
+	}
+}
+
+// TestCIModeInvariantViolation tests that --ci outputs GitHub Actions annotations for invariant violations
+func TestCIModeInvariantViolation(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url.env:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	cmd := exec.Command(binPath, "run", "--ci", "echo", "hello")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=prod",
+		"DB_URL_ENV=staging", // Mismatch - invariant fails
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Errorf("Expected CI mode to fail with invariant violation")
+	}
+
+	// Check exit code is 2
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 2 {
+			t.Errorf("Expected exit code 2 for invariant violation, got %d", exitErr.ExitCode())
+		}
+	}
+
+	// Should contain GitHub Actions annotation format
+	stderrStr := stderr.String()
+	if !bytes.Contains([]byte(stderrStr), []byte("::error file=admit.yaml::INVARIANT VIOLATION")) {
+		t.Errorf("Expected GitHub Actions annotation format for invariant, got: %s", stderrStr)
+	}
+}
+
+// TestAdmitCIEnvVar tests that ADMIT_CI=true enables CI mode
+func TestAdmitCIEnvVar(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	cmd := exec.Command(binPath, "run", "echo", "hello")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_CI=true",
+		// Missing DB_URL
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Errorf("Expected CI mode to fail with invalid config")
+	}
+
+	// Should contain GitHub Actions annotation format
+	stderrStr := stderr.String()
+	if !bytes.Contains([]byte(stderrStr), []byte("::error file=admit.yaml::")) {
+		t.Errorf("Expected GitHub Actions annotation format with ADMIT_CI=true, got: %s", stderrStr)
+	}
+}
+
+// TestSchemaNotFoundExitCode3 tests that missing schema file returns exit code 3
+func TestSchemaNotFoundExitCode3(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	tmpDir, err := os.MkdirTemp("", "admit-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Don't create any schema file
+	cmd := exec.Command(binPath, "check", "--schema", filepath.Join(tmpDir, "nonexistent.yaml"))
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err = cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Errorf("Expected check to fail with missing schema")
+	}
+
+	// Check exit code is 3
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 3 {
+			t.Errorf("Expected exit code 3 for schema error, got %d", exitErr.ExitCode())
+		}
+	}
+
+	// Should contain error message
+	if !bytes.Contains(stderr.Bytes(), []byte("schema file not found")) {
+		t.Errorf("Expected 'schema file not found' in error, got: %s", stderr.String())
+	}
+}
+
+// TestBackwardCompatibilityV2Invocations tests that v2 invocations still work
+func TestBackwardCompatibilityV2Invocations(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+  db.url.env:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+	artifactPath := filepath.Join(tmpDir, "artifact.json")
+
+	// Run with v2 flags (--artifact-file, --invariants-json)
+	cmd := exec.Command(binPath, "run", "--artifact-file", artifactPath, "--invariants-json", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=prod",
+		"DB_URL=postgres://localhost/prod",
+		"DB_URL_ENV=prod",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Errorf("Expected v2 invocation to succeed, got error: %v", err)
+	}
+
+	// Marker file should exist
+	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
+		t.Errorf("Expected marker file to be created")
+	}
+
+	// Artifact file should exist
+	if _, err := os.Stat(artifactPath); os.IsNotExist(err) {
+		t.Errorf("Expected artifact file to be created")
+	}
+
+	// Stdout should contain invariants JSON
+	if !bytes.Contains(stdout.Bytes(), []byte(`"allPassed"`)) {
+		t.Errorf("Expected invariants JSON in stdout, got: %s", stdout.String())
+	}
+}

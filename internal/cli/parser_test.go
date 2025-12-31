@@ -405,3 +405,256 @@ func TestParseArgs_InvariantsJSONFlag(t *testing.T) {
 		})
 	}
 }
+
+
+// TestParseArgs_CheckSubcommand tests the check subcommand
+func TestParseArgs_CheckSubcommand(t *testing.T) {
+	tests := []struct {
+		name           string
+		args           []string
+		wantSubcommand Subcommand
+		wantJSON       bool
+		wantSchema     string
+		wantErr        error
+	}{
+		{
+			name:           "check subcommand",
+			args:           []string{"check"},
+			wantSubcommand: SubcommandCheck,
+		},
+		{
+			name:           "check with --json",
+			args:           []string{"check", "--json"},
+			wantSubcommand: SubcommandCheck,
+			wantJSON:       true,
+		},
+		{
+			name:           "check with --schema",
+			args:           []string{"check", "--schema", "/app/admit.yaml"},
+			wantSubcommand: SubcommandCheck,
+			wantSchema:     "/app/admit.yaml",
+		},
+		{
+			name:           "check with --json and --schema",
+			args:           []string{"check", "--json", "--schema", "/app/admit.yaml"},
+			wantSubcommand: SubcommandCheck,
+			wantJSON:       true,
+			wantSchema:     "/app/admit.yaml",
+		},
+		{
+			name:           "run subcommand still works",
+			args:           []string{"run", "echo"},
+			wantSubcommand: SubcommandRun,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, err := ParseArgs(tt.args)
+			if tt.wantErr != nil {
+				if err != tt.wantErr {
+					t.Errorf("error = %v, want %v", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cmd.Subcommand != tt.wantSubcommand {
+				t.Errorf("Subcommand = %q, want %q", cmd.Subcommand, tt.wantSubcommand)
+			}
+			if cmd.JSONOutput != tt.wantJSON {
+				t.Errorf("JSONOutput = %v, want %v", cmd.JSONOutput, tt.wantJSON)
+			}
+			if cmd.SchemaPath != tt.wantSchema {
+				t.Errorf("SchemaPath = %q, want %q", cmd.SchemaPath, tt.wantSchema)
+			}
+		})
+	}
+}
+
+// TestParseArgs_V3Flags tests the new v3 flags
+func TestParseArgs_V3Flags(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantTarget string
+		wantSchema string
+		wantDryRun bool
+		wantCI     bool
+		wantJSON   bool
+	}{
+		{
+			name:       "schema flag",
+			args:       []string{"run", "--schema", "/app/admit.yaml", "echo"},
+			wantTarget: "echo",
+			wantSchema: "/app/admit.yaml",
+		},
+		{
+			name:       "dry-run flag",
+			args:       []string{"run", "--dry-run", "echo"},
+			wantTarget: "echo",
+			wantDryRun: true,
+		},
+		{
+			name:       "ci flag",
+			args:       []string{"run", "--ci", "echo"},
+			wantTarget: "echo",
+			wantCI:     true,
+		},
+		{
+			name:       "json flag",
+			args:       []string{"run", "--json", "echo"},
+			wantTarget: "echo",
+			wantJSON:   true,
+		},
+		{
+			name:       "all v3 flags",
+			args:       []string{"run", "--schema", "/app/admit.yaml", "--dry-run", "--ci", "--json", "node", "app.js"},
+			wantTarget: "node",
+			wantSchema: "/app/admit.yaml",
+			wantDryRun: true,
+			wantCI:     true,
+			wantJSON:   true,
+		},
+		{
+			name:       "v3 flags with v1 flags",
+			args:       []string{"run", "--schema", "/app/admit.yaml", "--artifact-stdout", "--identity", "echo"},
+			wantTarget: "echo",
+			wantSchema: "/app/admit.yaml",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, err := ParseArgs(tt.args)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cmd.Target != tt.wantTarget {
+				t.Errorf("Target = %q, want %q", cmd.Target, tt.wantTarget)
+			}
+			if cmd.SchemaPath != tt.wantSchema {
+				t.Errorf("SchemaPath = %q, want %q", cmd.SchemaPath, tt.wantSchema)
+			}
+			if cmd.DryRun != tt.wantDryRun {
+				t.Errorf("DryRun = %v, want %v", cmd.DryRun, tt.wantDryRun)
+			}
+			if cmd.CIMode != tt.wantCI {
+				t.Errorf("CIMode = %v, want %v", cmd.CIMode, tt.wantCI)
+			}
+			if cmd.JSONOutput != tt.wantJSON {
+				t.Errorf("JSONOutput = %v, want %v", cmd.JSONOutput, tt.wantJSON)
+			}
+		})
+	}
+}
+
+// TestParseArgs_V3FlagErrors tests error cases for v3 flags
+func TestParseArgs_V3FlagErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr error
+	}{
+		{
+			name:    "schema without value",
+			args:    []string{"run", "--schema"},
+			wantErr: ErrMissingFlagValue,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseArgs(tt.args)
+			if err != tt.wantErr {
+				t.Errorf("error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+
+// Feature: admit-v3-container-ci, Property 7: Backward Compatibility
+// Validates: Requirements 7.1, 7.2, 7.3
+// For any v2-compatible invocation (no new flags), behavior SHALL be identical to v2.
+func TestParseArgs_BackwardCompatibility_Property(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	// Property: v2 invocations still work with run subcommand
+	properties.Property("v2 invocations parse correctly", prop.ForAll(
+		func(target string, args []string) bool {
+			if target == "" {
+				return true // Skip empty targets
+			}
+			// Build v2-style args: ["run", target, arg1, arg2, ...]
+			inputArgs := append([]string{"run", target}, args...)
+			cmd, err := ParseArgs(inputArgs)
+			if err != nil {
+				return false
+			}
+			// Verify subcommand is run
+			if cmd.Subcommand != SubcommandRun {
+				return false
+			}
+			// Verify target is preserved
+			if cmd.Target != target {
+				return false
+			}
+			// Verify args are preserved
+			if len(cmd.Args) != len(args) {
+				return false
+			}
+			for i, arg := range args {
+				if cmd.Args[i] != arg {
+					return false
+				}
+			}
+			// Verify new v3 flags are not set
+			if cmd.SchemaPath != "" || cmd.DryRun || cmd.CIMode || cmd.JSONOutput {
+				return false
+			}
+			return true
+		},
+		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 }),
+		gen.SliceOf(gen.AlphaString()),
+	))
+
+	// Property: v1 flags still work
+	properties.Property("v1 flags still work", prop.ForAll(
+		func(target string) bool {
+			if target == "" {
+				return true
+			}
+			// Test with v1 flags
+			args := []string{"run", "--artifact-stdout", "--identity", target}
+			cmd, err := ParseArgs(args)
+			if err != nil {
+				return false
+			}
+			return cmd.Target == target && cmd.ArtifactStdout && cmd.Identity
+		},
+		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 }),
+	))
+
+	// Property: v2 invariants-json flag still works
+	properties.Property("v2 invariants-json flag still works", prop.ForAll(
+		func(target string) bool {
+			if target == "" {
+				return true
+			}
+			args := []string{"run", "--invariants-json", target}
+			cmd, err := ParseArgs(args)
+			if err != nil {
+				return false
+			}
+			return cmd.Target == target && cmd.InvariantsJSON
+		},
+		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 }),
+	))
+
+	properties.TestingRun(t)
+}

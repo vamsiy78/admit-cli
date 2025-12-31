@@ -928,3 +928,1101 @@ invariants:
 
 	properties.TestingRun(t)
 }
+
+
+// Feature: admit-v3-container-ci, Property 2: Schema Path Resolution
+// Validates: Requirements 2.4, 2.5, 5.1, 5.2, 5.3, 5.4
+// For any combination of --schema flag and ADMIT_SCHEMA env var:
+// - If only flag is set, use flag value
+// - If only env var is set, use env var value
+// - If both are set, flag value SHALL take precedence
+func TestSchemaPathResolution_Property(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	// Property: --schema flag takes precedence over ADMIT_SCHEMA env var
+	properties.Property("--schema flag takes precedence over ADMIT_SCHEMA", prop.ForAll(
+		func(flagPath string, envPath string) bool {
+			if flagPath == "" || envPath == "" {
+				return true // Skip empty paths
+			}
+
+			// Create temp directories for both paths
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true // Skip on setup failure
+			}
+			defer os.RemoveAll(tmpDir)
+
+			// Create schema at flag path
+			flagSchemaPath := filepath.Join(tmpDir, "flag-schema.yaml")
+			envSchemaPath := filepath.Join(tmpDir, "env-schema.yaml")
+
+			// Write different schemas to distinguish which one is loaded
+			flagSchemaContent := `config:
+  flag.marker:
+    type: string
+    required: true
+`
+			envSchemaContent := `config:
+  env.marker:
+    type: string
+    required: true
+`
+			if err := os.WriteFile(flagSchemaPath, []byte(flagSchemaContent), 0644); err != nil {
+				return true
+			}
+			if err := os.WriteFile(envSchemaPath, []byte(envSchemaContent), 0644); err != nil {
+				return true
+			}
+
+			// Set up environment with ADMIT_SCHEMA pointing to env schema
+			environ := []string{
+				"ADMIT_SCHEMA=" + envSchemaPath,
+				"FLAG_MARKER=value", // For flag schema
+			}
+
+			// Capture stderr to check which schema was loaded
+			oldStderr := os.Stderr
+			r, w, err := os.Pipe()
+			if err != nil {
+				return true
+			}
+			os.Stderr = w
+
+			// Run with --schema flag pointing to flag schema
+			args := []string{"run", "--schema", flagSchemaPath, "true"}
+			exitCode := run(args, environ, tmpDir)
+
+			w.Close()
+			os.Stderr = oldStderr
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+			r.Close()
+
+			// If flag schema was used, it should fail because FLAG_MARKER is set
+			// but flag.marker is required (and FLAG_MARKER maps to FLAG_MARKER env var)
+			// Actually, let's check the error message
+			output := buf.String()
+
+			// The flag schema requires flag.marker, so error should mention flag.marker
+			// If env schema was used, error would mention env.marker
+			return exitCode == 1 && strings.Contains(output, "flag.marker")
+		},
+		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 && len(s) < 20 }),
+		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 && len(s) < 20 }),
+	))
+
+	// Property: ADMIT_SCHEMA env var is used when no flag provided
+	properties.Property("ADMIT_SCHEMA env var is used when no flag provided", prop.ForAll(
+		func(schemaName string) bool {
+			if schemaName == "" {
+				return true
+			}
+
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			// Create schema at custom path
+			customSchemaPath := filepath.Join(tmpDir, schemaName+".yaml")
+			schemaContent := `config:
+  custom.key:
+    type: string
+    required: true
+`
+			if err := os.WriteFile(customSchemaPath, []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			// Set up environment with ADMIT_SCHEMA
+			environ := []string{
+				"ADMIT_SCHEMA=" + customSchemaPath,
+			}
+
+			// Capture stderr
+			oldStderr := os.Stderr
+			r, w, err := os.Pipe()
+			if err != nil {
+				return true
+			}
+			os.Stderr = w
+
+			// Run WITHOUT --schema flag
+			args := []string{"run", "true"}
+			exitCode := run(args, environ, tmpDir)
+
+			w.Close()
+			os.Stderr = oldStderr
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+			r.Close()
+
+			// Should fail because custom.key is required but not set
+			// Error should mention custom.key (proving custom schema was loaded)
+			output := buf.String()
+			return exitCode == 1 && strings.Contains(output, "custom.key")
+		},
+		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 && len(s) < 20 }),
+	))
+
+	// Property: default admit.yaml is used when neither flag nor env var set
+	properties.Property("default admit.yaml is used when neither flag nor env var set", prop.ForAll(
+		func(dbUrl string) bool {
+			if dbUrl == "" {
+				dbUrl = "test"
+			}
+
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			// Create default admit.yaml
+			schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			// Set up environment WITHOUT ADMIT_SCHEMA
+			environ := []string{
+				"DB_URL=" + dbUrl,
+			}
+
+			// Run WITHOUT --schema flag
+			args := []string{"run", "true"}
+			exitCode := run(args, environ, tmpDir)
+
+			// Should succeed (exit 0 or exec error, but not 1 or 2)
+			return exitCode != 1 && exitCode != 2
+		},
+		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 }),
+	))
+
+	properties.TestingRun(t)
+}
+
+// Feature: admit-v3-container-ci, Property 3: Missing Schema Error
+// Validates: Requirements 5.5
+// For any schema path that does not exist, the CLI SHALL exit with code 3
+func TestMissingSchemaError_Property(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	// Property: non-existent schema path exits with code 3
+	properties.Property("non-existent schema path exits with code 3", prop.ForAll(
+		func(nonExistentPath string) bool {
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			// Use a path that definitely doesn't exist
+			schemaPath := filepath.Join(tmpDir, nonExistentPath, "nonexistent.yaml")
+
+			// Capture stderr
+			oldStderr := os.Stderr
+			r, w, err := os.Pipe()
+			if err != nil {
+				return true
+			}
+			os.Stderr = w
+
+			// Run with --schema pointing to non-existent file
+			args := []string{"run", "--schema", schemaPath, "true"}
+			exitCode := run(args, []string{}, tmpDir)
+
+			w.Close()
+			os.Stderr = oldStderr
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+			r.Close()
+
+			// Exit code should be 3 (schema error)
+			// Error message should mention the path
+			output := buf.String()
+			return exitCode == 3 && strings.Contains(output, "schema file not found")
+		},
+		gen.Identifier(),
+	))
+
+	// Property: ADMIT_SCHEMA pointing to non-existent file exits with code 3
+	properties.Property("ADMIT_SCHEMA pointing to non-existent file exits with code 3", prop.ForAll(
+		func(nonExistentPath string) bool {
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			// Use a path that definitely doesn't exist
+			schemaPath := filepath.Join(tmpDir, nonExistentPath, "nonexistent.yaml")
+
+			// Set up environment with ADMIT_SCHEMA pointing to non-existent file
+			environ := []string{
+				"ADMIT_SCHEMA=" + schemaPath,
+			}
+
+			// Run WITHOUT --schema flag
+			args := []string{"run", "true"}
+			exitCode := run(args, environ, tmpDir)
+
+			// Exit code should be 3 (schema error)
+			return exitCode == 3
+		},
+		gen.Identifier(),
+	))
+
+	properties.TestingRun(t)
+}
+
+
+// Feature: admit-v3-container-ci, Property 1: Check Validation Equivalence
+// Validates: Requirements 3.1, 3.2, 3.3, 3.4
+// For any schema and environment configuration, `admit check` SHALL produce
+// the same validation and invariant results as `admit run` would compute
+// before execution, without actually executing any command.
+func TestCheckValidationEquivalence_Property(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	// Property: check produces same exit code as run would for valid config
+	properties.Property("check produces exit code 0 for valid config", prop.ForAll(
+		func(dbUrl string, mode string) bool {
+			if dbUrl == "" {
+				dbUrl = "test"
+			}
+
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+  payments.mode:
+    type: enum
+    values: [test, live]
+    required: true
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			environ := []string{
+				"DB_URL=" + dbUrl,
+				"PAYMENTS_MODE=" + mode,
+			}
+
+			// Run check subcommand
+			args := []string{"check"}
+			exitCode := run(args, environ, tmpDir)
+
+			// Should exit with 0 for valid config
+			return exitCode == 0
+		},
+		gen.Identifier(),
+		gen.OneConstOf("test", "live"),
+	))
+
+	// Property: check produces exit code 1 for validation errors
+	properties.Property("check produces exit code 1 for validation errors", prop.ForAll(
+		func(invalidMode string) bool {
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  payments.mode:
+    type: enum
+    values: [test, live]
+    required: true
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			environ := []string{
+				"PAYMENTS_MODE=" + invalidMode,
+			}
+
+			args := []string{"check"}
+			exitCode := run(args, environ, tmpDir)
+
+			// Should exit with 1 for validation error
+			return exitCode == 1
+		},
+		gen.Identifier().SuchThat(func(s string) bool {
+			return s != "test" && s != "live"
+		}),
+	))
+
+	// Property: check produces exit code 2 for invariant violations
+	properties.Property("check produces exit code 2 for invariant violations", prop.ForAll(
+		func(nonProdEnv string) bool {
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  db.url.env:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			// Set up environment where invariant FAILS
+			environ := []string{
+				"DB_URL_ENV=" + nonProdEnv,
+				"ADMIT_ENV=prod",
+			}
+
+			args := []string{"check"}
+			exitCode := run(args, environ, tmpDir)
+
+			// Should exit with 2 for invariant violation
+			return exitCode == 2
+		},
+		gen.OneConstOf("staging", "dev", "test"),
+	))
+
+	// Property: check does not execute any command
+	properties.Property("check does not execute any command", prop.ForAll(
+		func(dbUrl string) bool {
+			if dbUrl == "" {
+				dbUrl = "test"
+			}
+
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			// Create a marker file that would be created if a command ran
+			markerFile := filepath.Join(tmpDir, "executed.marker")
+
+			environ := []string{
+				"DB_URL=" + dbUrl,
+			}
+
+			// Check subcommand should NOT execute any command
+			// Even if we somehow passed a command, it shouldn't run
+			args := []string{"check"}
+			_ = run(args, environ, tmpDir)
+
+			// Marker file should NOT exist
+			_, err = os.Stat(markerFile)
+			return os.IsNotExist(err)
+		},
+		gen.Identifier(),
+	))
+
+	properties.TestingRun(t)
+}
+
+// Feature: admit-v3-container-ci, Property 8: Check JSON Output Structure
+// Validates: Requirements 3.5
+// For any `admit check --json` invocation, the output SHALL be valid JSON
+// containing: valid (boolean), validationErrors (array), invariantResults (array),
+// schemaPath (string)
+func TestCheckJSONOutputStructure_Property(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	// Property: check --json produces valid JSON with required fields
+	properties.Property("check --json produces valid JSON with required fields", prop.ForAll(
+		func(dbUrl string, mode string) bool {
+			if dbUrl == "" {
+				dbUrl = "test"
+			}
+
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+  payments.mode:
+    type: enum
+    values: [test, live]
+    required: true
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			environ := []string{
+				"DB_URL=" + dbUrl,
+				"PAYMENTS_MODE=" + mode,
+			}
+
+			// Capture stdout
+			oldStdout := os.Stdout
+			r, w, err := os.Pipe()
+			if err != nil {
+				return true
+			}
+			os.Stdout = w
+
+			args := []string{"check", "--json"}
+			_ = run(args, environ, tmpDir)
+
+			w.Close()
+			os.Stdout = oldStdout
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+			r.Close()
+
+			output := buf.String()
+
+			// Check that output contains required JSON fields
+			return strings.Contains(output, `"valid"`) &&
+				strings.Contains(output, `"validationErrors"`) &&
+				strings.Contains(output, `"invariantResults"`) &&
+				strings.Contains(output, `"schemaPath"`)
+		},
+		gen.Identifier(),
+		gen.OneConstOf("test", "live"),
+	))
+
+	properties.TestingRun(t)
+}
+
+
+// Feature: admit-v3-container-ci, Property 4: Dry Run Non-Execution
+// Validates: Requirements 6.1, 6.2, 6.3, 6.4
+// For any configuration (valid or invalid), when --dry-run flag is provided,
+// the target command SHALL never be executed, and the CLI SHALL output
+// validation results only.
+func TestDryRunNonExecution_Property(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	// Property: dry-run does not execute command for valid config
+	properties.Property("dry-run does not execute command for valid config", prop.ForAll(
+		func(dbUrl string) bool {
+			if dbUrl == "" {
+				dbUrl = "test"
+			}
+
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			// Create a marker file that would be created if command ran
+			markerFile := filepath.Join(tmpDir, "executed.marker")
+
+			environ := []string{
+				"DB_URL=" + dbUrl,
+			}
+
+			// Run with --dry-run flag
+			args := []string{"run", "--dry-run", "touch", markerFile}
+			exitCode := run(args, environ, tmpDir)
+
+			// Should exit with 0 (valid config)
+			if exitCode != 0 {
+				return false
+			}
+
+			// Marker file should NOT exist (command was not executed)
+			_, err = os.Stat(markerFile)
+			return os.IsNotExist(err)
+		},
+		gen.Identifier(),
+	))
+
+	// Property: dry-run outputs "Config valid, would execute" for valid config
+	properties.Property("dry-run outputs success message for valid config", prop.ForAll(
+		func(dbUrl string) bool {
+			if dbUrl == "" {
+				dbUrl = "test"
+			}
+
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			environ := []string{
+				"DB_URL=" + dbUrl,
+			}
+
+			// Capture stdout
+			oldStdout := os.Stdout
+			r, w, err := os.Pipe()
+			if err != nil {
+				return true
+			}
+			os.Stdout = w
+
+			args := []string{"run", "--dry-run", "echo", "hello"}
+			_ = run(args, environ, tmpDir)
+
+			w.Close()
+			os.Stdout = oldStdout
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+			r.Close()
+
+			output := buf.String()
+			return strings.Contains(output, "Config valid") && strings.Contains(output, "would execute")
+		},
+		gen.Identifier(),
+	))
+
+	// Property: dry-run outputs validation errors for invalid config
+	properties.Property("dry-run outputs validation errors for invalid config", prop.ForAll(
+		func(invalidMode string) bool {
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  payments.mode:
+    type: enum
+    values: [test, live]
+    required: true
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			environ := []string{
+				"PAYMENTS_MODE=" + invalidMode,
+			}
+
+			// Capture stderr
+			oldStderr := os.Stderr
+			r, w, err := os.Pipe()
+			if err != nil {
+				return true
+			}
+			os.Stderr = w
+
+			args := []string{"run", "--dry-run", "echo", "hello"}
+			exitCode := run(args, environ, tmpDir)
+
+			w.Close()
+			os.Stderr = oldStderr
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+			r.Close()
+
+			// Should exit with 1 (validation error)
+			// Should have error output
+			output := buf.String()
+			return exitCode == 1 && strings.Contains(output, "payments.mode")
+		},
+		gen.Identifier().SuchThat(func(s string) bool {
+			return s != "test" && s != "live"
+		}),
+	))
+
+	// Property: dry-run --json outputs JSON with command info
+	properties.Property("dry-run --json outputs JSON with command info", prop.ForAll(
+		func(dbUrl string) bool {
+			if dbUrl == "" {
+				dbUrl = "test"
+			}
+
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			environ := []string{
+				"DB_URL=" + dbUrl,
+			}
+
+			// Capture stdout
+			oldStdout := os.Stdout
+			r, w, err := os.Pipe()
+			if err != nil {
+				return true
+			}
+			os.Stdout = w
+
+			args := []string{"run", "--dry-run", "--json", "echo", "hello"}
+			_ = run(args, environ, tmpDir)
+
+			w.Close()
+			os.Stdout = oldStdout
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+			r.Close()
+
+			output := buf.String()
+			return strings.Contains(output, `"valid"`) &&
+				strings.Contains(output, `"command"`) &&
+				strings.Contains(output, `"args"`) &&
+				strings.Contains(output, `"schemaPath"`)
+		},
+		gen.Identifier(),
+	))
+
+	properties.TestingRun(t)
+}
+
+
+// Feature: admit-v3-container-ci, Property 5: CI Annotation Format Compliance
+// Validates: Requirements 4.2, 4.3, 4.5
+// For any validation error or invariant violation in CI mode (--ci flag or
+// ADMIT_CI=true), the output SHALL conform to GitHub Actions annotation syntax:
+// ::error file=<file>::<message>
+func TestCIAnnotationFormat_Property(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	// Property: --ci flag produces GitHub Actions annotation format
+	properties.Property("--ci flag produces GitHub Actions annotation format", prop.ForAll(
+		func(invalidMode string) bool {
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  payments.mode:
+    type: enum
+    values: [test, live]
+    required: true
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			environ := []string{
+				"PAYMENTS_MODE=" + invalidMode,
+			}
+
+			// Capture stderr
+			oldStderr := os.Stderr
+			r, w, err := os.Pipe()
+			if err != nil {
+				return true
+			}
+			os.Stderr = w
+
+			args := []string{"run", "--ci", "echo", "hello"}
+			_ = run(args, environ, tmpDir)
+
+			w.Close()
+			os.Stderr = oldStderr
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+			r.Close()
+
+			output := buf.String()
+			// Should contain GitHub Actions annotation format
+			return strings.Contains(output, "::error file=admit.yaml::")
+		},
+		gen.Identifier().SuchThat(func(s string) bool {
+			return s != "test" && s != "live"
+		}),
+	))
+
+	// Property: ADMIT_CI=true produces GitHub Actions annotation format
+	properties.Property("ADMIT_CI=true produces GitHub Actions annotation format", prop.ForAll(
+		func(invalidMode string) bool {
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  payments.mode:
+    type: enum
+    values: [test, live]
+    required: true
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			environ := []string{
+				"PAYMENTS_MODE=" + invalidMode,
+				"ADMIT_CI=true",
+			}
+
+			// Capture stderr
+			oldStderr := os.Stderr
+			r, w, err := os.Pipe()
+			if err != nil {
+				return true
+			}
+			os.Stderr = w
+
+			args := []string{"run", "echo", "hello"}
+			_ = run(args, environ, tmpDir)
+
+			w.Close()
+			os.Stderr = oldStderr
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+			r.Close()
+
+			output := buf.String()
+			// Should contain GitHub Actions annotation format
+			return strings.Contains(output, "::error file=admit.yaml::")
+		},
+		gen.Identifier().SuchThat(func(s string) bool {
+			return s != "test" && s != "live"
+		}),
+	))
+
+	// Property: CI mode includes summary of failures
+	properties.Property("CI mode includes summary of failures", prop.ForAll(
+		func(invalidMode string) bool {
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  payments.mode:
+    type: enum
+    values: [test, live]
+    required: true
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			environ := []string{
+				"PAYMENTS_MODE=" + invalidMode,
+			}
+
+			// Capture stderr
+			oldStderr := os.Stderr
+			r, w, err := os.Pipe()
+			if err != nil {
+				return true
+			}
+			os.Stderr = w
+
+			args := []string{"run", "--ci", "echo", "hello"}
+			_ = run(args, environ, tmpDir)
+
+			w.Close()
+			os.Stderr = oldStderr
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+			r.Close()
+
+			output := buf.String()
+			// Should contain summary
+			return strings.Contains(output, "Validation failed") || strings.Contains(output, "error")
+		},
+		gen.Identifier().SuchThat(func(s string) bool {
+			return s != "test" && s != "live"
+		}),
+	))
+
+	// Property: CI mode formats invariant violations with annotation
+	properties.Property("CI mode formats invariant violations with annotation", prop.ForAll(
+		func(nonProdEnv string) bool {
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  db.url.env:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			environ := []string{
+				"DB_URL_ENV=" + nonProdEnv,
+				"ADMIT_ENV=prod",
+			}
+
+			// Capture stderr
+			oldStderr := os.Stderr
+			r, w, err := os.Pipe()
+			if err != nil {
+				return true
+			}
+			os.Stderr = w
+
+			args := []string{"run", "--ci", "echo", "hello"}
+			_ = run(args, environ, tmpDir)
+
+			w.Close()
+			os.Stderr = oldStderr
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+			r.Close()
+
+			output := buf.String()
+			// Should contain annotation format for invariant violation
+			return strings.Contains(output, "::error file=admit.yaml::INVARIANT VIOLATION")
+		},
+		gen.OneConstOf("staging", "dev", "test"),
+	))
+
+	properties.TestingRun(t)
+}
+
+
+// Feature: admit-v3-container-ci, Property 6: Exit Code Consistency
+// Validates: Requirements 3.2, 3.3, 3.4, 7.4
+// For any scenario, exit codes SHALL be consistent across all modes:
+// 0 = success, 1 = validation error, 2 = invariant violation, 3 = schema error
+func TestExitCodeConsistency_Property(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	// Property: valid config produces exit code 0 across all modes
+	properties.Property("valid config produces exit code 0 across all modes", prop.ForAll(
+		func(dbUrl string) bool {
+			if dbUrl == "" {
+				dbUrl = "test"
+			}
+
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			environ := []string{
+				"DB_URL=" + dbUrl,
+			}
+
+			// Test check subcommand
+			checkCode := run([]string{"check"}, environ, tmpDir)
+
+			// Test dry-run mode
+			dryRunCode := run([]string{"run", "--dry-run", "echo", "hello"}, environ, tmpDir)
+
+			// Both should return 0 for valid config
+			return checkCode == 0 && dryRunCode == 0
+		},
+		gen.Identifier(),
+	))
+
+	// Property: validation error produces exit code 1 across all modes
+	properties.Property("validation error produces exit code 1 across all modes", prop.ForAll(
+		func(invalidMode string) bool {
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  payments.mode:
+    type: enum
+    values: [test, live]
+    required: true
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			environ := []string{
+				"PAYMENTS_MODE=" + invalidMode,
+			}
+
+			// Test check subcommand
+			checkCode := run([]string{"check"}, environ, tmpDir)
+
+			// Test dry-run mode
+			dryRunCode := run([]string{"run", "--dry-run", "echo", "hello"}, environ, tmpDir)
+
+			// Test run mode (will fail before exec)
+			runCode := run([]string{"run", "echo", "hello"}, environ, tmpDir)
+
+			// All should return 1 for validation error
+			return checkCode == 1 && dryRunCode == 1 && runCode == 1
+		},
+		gen.Identifier().SuchThat(func(s string) bool {
+			return s != "test" && s != "live"
+		}),
+	))
+
+	// Property: invariant violation produces exit code 2 across all modes
+	properties.Property("invariant violation produces exit code 2 across all modes", prop.ForAll(
+		func(nonProdEnv string) bool {
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  db.url.env:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+`
+			if err := os.WriteFile(filepath.Join(tmpDir, "admit.yaml"), []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			environ := []string{
+				"DB_URL_ENV=" + nonProdEnv,
+				"ADMIT_ENV=prod",
+			}
+
+			// Test check subcommand
+			checkCode := run([]string{"check"}, environ, tmpDir)
+
+			// Test dry-run mode
+			dryRunCode := run([]string{"run", "--dry-run", "echo", "hello"}, environ, tmpDir)
+
+			// Test run mode (will fail before exec)
+			runCode := run([]string{"run", "echo", "hello"}, environ, tmpDir)
+
+			// All should return 2 for invariant violation
+			return checkCode == 2 && dryRunCode == 2 && runCode == 2
+		},
+		gen.OneConstOf("staging", "dev", "test"),
+	))
+
+	// Property: schema error produces exit code 3 across all modes
+	properties.Property("schema error produces exit code 3 across all modes", prop.ForAll(
+		func(nonExistentPath string) bool {
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaPath := filepath.Join(tmpDir, nonExistentPath, "nonexistent.yaml")
+
+			// Test check subcommand with --schema
+			checkCode := run([]string{"check", "--schema", schemaPath}, []string{}, tmpDir)
+
+			// Test dry-run mode with --schema
+			dryRunCode := run([]string{"run", "--dry-run", "--schema", schemaPath, "echo", "hello"}, []string{}, tmpDir)
+
+			// Test run mode with --schema
+			runCode := run([]string{"run", "--schema", schemaPath, "echo", "hello"}, []string{}, tmpDir)
+
+			// All should return 3 for schema error
+			return checkCode == 3 && dryRunCode == 3 && runCode == 3
+		},
+		gen.Identifier(),
+	))
+
+	properties.TestingRun(t)
+}
