@@ -18,8 +18,10 @@ var ErrMissingFlagValue = errors.New("flag requires a value")
 type Subcommand string
 
 const (
-	SubcommandRun   Subcommand = "run"
-	SubcommandCheck Subcommand = "check"
+	SubcommandRun       Subcommand = "run"
+	SubcommandCheck     Subcommand = "check"
+	SubcommandReplay    Subcommand = "replay"    // v5: replay an execution
+	SubcommandSnapshots Subcommand = "snapshots" // v5: list/manage snapshots
 )
 
 // Command represents the parsed CLI input
@@ -56,6 +58,12 @@ type Command struct {
 	ExecutionIDJSON bool   // --execution-id-json
 	ExecutionIDFile string // --execution-id-file <path>
 	ExecutionIDEnv  string // --execution-id-env <varname>
+
+	// v5 Snapshot flags
+	Snapshot  bool   // --snapshot (for run)
+	ReplayID  string // execution ID for replay subcommand
+	PruneDays int    // --prune <days> (for snapshots)
+	DeleteID  string // --delete <execution_id> (for snapshots)
 }
 
 // ParseArgs parses CLI arguments into a Command.
@@ -67,9 +75,12 @@ func ParseArgs(args []string) (Command, error) {
 		return Command{}, ErrNoRunSubcommand
 	}
 
-	// First arg must be "run" or "check"
+	// First arg must be a valid subcommand
 	subcommand := args[0]
-	if subcommand != "run" && subcommand != "check" {
+	switch subcommand {
+	case "run", "check", "replay", "snapshots":
+		// Valid subcommands
+	default:
 		return Command{}, ErrNoRunSubcommand
 	}
 
@@ -77,7 +88,17 @@ func ParseArgs(args []string) (Command, error) {
 		Subcommand: Subcommand(subcommand),
 	}
 
-	// Parse flags and find the command
+	// Handle replay subcommand: admit replay <execution_id> [flags]
+	if subcommand == "replay" {
+		return parseReplayArgs(args[1:], cmd)
+	}
+
+	// Handle snapshots subcommand: admit snapshots [flags]
+	if subcommand == "snapshots" {
+		return parseSnapshotsArgs(args[1:], cmd)
+	}
+
+	// Parse flags and find the command (for run/check)
 	i := 1 // Start after subcommand
 
 	for i < len(args) {
@@ -151,6 +172,8 @@ func ParseArgs(args []string) (Command, error) {
 				}
 				i++
 				cmd.ExecutionIDEnv = args[i]
+			case "snapshot":
+				cmd.Snapshot = true
 			default:
 				// Unknown flag - treat as start of command
 				break
@@ -173,4 +196,99 @@ func ParseArgs(args []string) (Command, error) {
 	}
 
 	return cmd, nil
+}
+
+// parseReplayArgs parses arguments for the replay subcommand.
+func parseReplayArgs(args []string, cmd Command) (Command, error) {
+	i := 0
+
+	for i < len(args) {
+		arg := args[i]
+
+		if strings.HasPrefix(arg, "--") {
+			flagName := strings.TrimPrefix(arg, "--")
+			switch flagName {
+			case "dry-run":
+				cmd.DryRun = true
+			case "json":
+				cmd.JSONOutput = true
+			case "schema":
+				if i+1 >= len(args) {
+					return Command{}, ErrMissingFlagValue
+				}
+				i++
+				cmd.SchemaPath = args[i]
+			default:
+				// Unknown flag
+			}
+			i++
+			continue
+		}
+
+		// Not a flag - this is the execution ID
+		if cmd.ReplayID == "" {
+			cmd.ReplayID = arg
+		}
+		i++
+	}
+
+	// Replay requires an execution ID
+	if cmd.ReplayID == "" {
+		return Command{}, errors.New("replay requires an execution ID: usage: admit replay <execution_id>")
+	}
+
+	return cmd, nil
+}
+
+// parseSnapshotsArgs parses arguments for the snapshots subcommand.
+func parseSnapshotsArgs(args []string, cmd Command) (Command, error) {
+	i := 0
+
+	for i < len(args) {
+		arg := args[i]
+
+		if strings.HasPrefix(arg, "--") {
+			flagName := strings.TrimPrefix(arg, "--")
+			switch flagName {
+			case "json":
+				cmd.JSONOutput = true
+			case "prune":
+				if i+1 >= len(args) {
+					return Command{}, ErrMissingFlagValue
+				}
+				i++
+				days, err := parseInt(args[i])
+				if err != nil {
+					return Command{}, errors.New("--prune requires a number of days")
+				}
+				cmd.PruneDays = days
+			case "delete":
+				if i+1 >= len(args) {
+					return Command{}, ErrMissingFlagValue
+				}
+				i++
+				cmd.DeleteID = args[i]
+			default:
+				// Unknown flag
+			}
+			i++
+			continue
+		}
+
+		i++
+	}
+
+	return cmd, nil
+}
+
+// parseInt parses a string to int.
+func parseInt(s string) (int, error) {
+	var n int
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, errors.New("not a number")
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, nil
 }

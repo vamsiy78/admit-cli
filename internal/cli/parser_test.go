@@ -873,3 +873,277 @@ func TestParseArgs_V4BackwardCompatibility_Property(t *testing.T) {
 
 	properties.TestingRun(t)
 }
+
+// TestParseArgs_V5ReplaySubcommand tests the replay subcommand
+func TestParseArgs_V5ReplaySubcommand(t *testing.T) {
+	tests := []struct {
+		name           string
+		args           []string
+		wantSubcommand Subcommand
+		wantReplayID   string
+		wantDryRun     bool
+		wantJSON       bool
+		wantErr        bool
+	}{
+		{
+			name:           "replay with execution ID",
+			args:           []string{"replay", "sha256:abc123"},
+			wantSubcommand: SubcommandReplay,
+			wantReplayID:   "sha256:abc123",
+		},
+		{
+			name:           "replay with --dry-run",
+			args:           []string{"replay", "--dry-run", "sha256:abc123"},
+			wantSubcommand: SubcommandReplay,
+			wantReplayID:   "sha256:abc123",
+			wantDryRun:     true,
+		},
+		{
+			name:           "replay with --json",
+			args:           []string{"replay", "--json", "sha256:abc123"},
+			wantSubcommand: SubcommandReplay,
+			wantReplayID:   "sha256:abc123",
+			wantJSON:       true,
+		},
+		{
+			name:           "replay with flags after ID",
+			args:           []string{"replay", "sha256:abc123", "--dry-run"},
+			wantSubcommand: SubcommandReplay,
+			wantReplayID:   "sha256:abc123",
+			wantDryRun:     true,
+		},
+		{
+			name:    "replay without execution ID",
+			args:    []string{"replay"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, err := ParseArgs(tt.args)
+			if tt.wantErr {
+				if err == nil {
+					t.Error("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cmd.Subcommand != tt.wantSubcommand {
+				t.Errorf("Subcommand = %q, want %q", cmd.Subcommand, tt.wantSubcommand)
+			}
+			if cmd.ReplayID != tt.wantReplayID {
+				t.Errorf("ReplayID = %q, want %q", cmd.ReplayID, tt.wantReplayID)
+			}
+			if cmd.DryRun != tt.wantDryRun {
+				t.Errorf("DryRun = %v, want %v", cmd.DryRun, tt.wantDryRun)
+			}
+			if cmd.JSONOutput != tt.wantJSON {
+				t.Errorf("JSONOutput = %v, want %v", cmd.JSONOutput, tt.wantJSON)
+			}
+		})
+	}
+}
+
+// TestParseArgs_V5SnapshotsSubcommand tests the snapshots subcommand
+func TestParseArgs_V5SnapshotsSubcommand(t *testing.T) {
+	tests := []struct {
+		name           string
+		args           []string
+		wantSubcommand Subcommand
+		wantJSON       bool
+		wantPruneDays  int
+		wantDeleteID   string
+		wantErr        bool
+	}{
+		{
+			name:           "snapshots list",
+			args:           []string{"snapshots"},
+			wantSubcommand: SubcommandSnapshots,
+		},
+		{
+			name:           "snapshots with --json",
+			args:           []string{"snapshots", "--json"},
+			wantSubcommand: SubcommandSnapshots,
+			wantJSON:       true,
+		},
+		{
+			name:           "snapshots with --prune",
+			args:           []string{"snapshots", "--prune", "30"},
+			wantSubcommand: SubcommandSnapshots,
+			wantPruneDays:  30,
+		},
+		{
+			name:           "snapshots with --delete",
+			args:           []string{"snapshots", "--delete", "sha256:abc123"},
+			wantSubcommand: SubcommandSnapshots,
+			wantDeleteID:   "sha256:abc123",
+		},
+		{
+			name:    "snapshots --prune without value",
+			args:    []string{"snapshots", "--prune"},
+			wantErr: true,
+		},
+		{
+			name:    "snapshots --delete without value",
+			args:    []string{"snapshots", "--delete"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, err := ParseArgs(tt.args)
+			if tt.wantErr {
+				if err == nil {
+					t.Error("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cmd.Subcommand != tt.wantSubcommand {
+				t.Errorf("Subcommand = %q, want %q", cmd.Subcommand, tt.wantSubcommand)
+			}
+			if cmd.JSONOutput != tt.wantJSON {
+				t.Errorf("JSONOutput = %v, want %v", cmd.JSONOutput, tt.wantJSON)
+			}
+			if cmd.PruneDays != tt.wantPruneDays {
+				t.Errorf("PruneDays = %d, want %d", cmd.PruneDays, tt.wantPruneDays)
+			}
+			if cmd.DeleteID != tt.wantDeleteID {
+				t.Errorf("DeleteID = %q, want %q", cmd.DeleteID, tt.wantDeleteID)
+			}
+		})
+	}
+}
+
+// TestParseArgs_V5SnapshotFlag tests the --snapshot flag for run
+func TestParseArgs_V5SnapshotFlag(t *testing.T) {
+	tests := []struct {
+		name         string
+		args         []string
+		wantTarget   string
+		wantSnapshot bool
+	}{
+		{
+			name:         "run with --snapshot",
+			args:         []string{"run", "--snapshot", "echo"},
+			wantTarget:   "echo",
+			wantSnapshot: true,
+		},
+		{
+			name:         "run without --snapshot",
+			args:         []string{"run", "echo"},
+			wantTarget:   "echo",
+			wantSnapshot: false,
+		},
+		{
+			name:         "run with --snapshot and other flags",
+			args:         []string{"run", "--snapshot", "--execution-id", "node", "app.js"},
+			wantTarget:   "node",
+			wantSnapshot: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, err := ParseArgs(tt.args)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cmd.Target != tt.wantTarget {
+				t.Errorf("Target = %q, want %q", cmd.Target, tt.wantTarget)
+			}
+			if cmd.Snapshot != tt.wantSnapshot {
+				t.Errorf("Snapshot = %v, want %v", cmd.Snapshot, tt.wantSnapshot)
+			}
+		})
+	}
+}
+
+// Feature: admit-v5-execution-replay, Property 10: Backward Compatibility
+// Validates: Requirements 7.1, 7.2, 7.3
+// For any v4-compatible invocation (no v5 flags), behavior SHALL be identical to v4.
+func TestParseArgs_V5BackwardCompatibility_Property(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	// Property: v4 invocations still work
+	properties.Property("v4 invocations parse correctly without v5 flags set", prop.ForAll(
+		func(target string, args []string) bool {
+			if target == "" {
+				return true // Skip empty targets
+			}
+			// Build v4-style args: ["run", target, arg1, arg2, ...]
+			inputArgs := append([]string{"run", target}, args...)
+			cmd, err := ParseArgs(inputArgs)
+			if err != nil {
+				return false
+			}
+			// Verify subcommand is run
+			if cmd.Subcommand != SubcommandRun {
+				return false
+			}
+			// Verify target is preserved
+			if cmd.Target != target {
+				return false
+			}
+			// Verify args are preserved
+			if len(cmd.Args) != len(args) {
+				return false
+			}
+			for i, arg := range args {
+				if cmd.Args[i] != arg {
+					return false
+				}
+			}
+			// Verify v5 flags are not set
+			if cmd.Snapshot || cmd.ReplayID != "" || cmd.PruneDays != 0 || cmd.DeleteID != "" {
+				return false
+			}
+			return true
+		},
+		gen.Identifier(),
+		gen.SliceOf(gen.AlphaString()),
+	))
+
+	// Property: v4 execution-id flags still work
+	properties.Property("v4 execution-id flags work independently of v5 flags", prop.ForAll(
+		func(target string) bool {
+			if target == "" {
+				return true
+			}
+			args := []string{"run", "--execution-id", "--execution-id-json", target}
+			cmd, err := ParseArgs(args)
+			if err != nil {
+				return false
+			}
+			return cmd.Target == target && cmd.ExecutionID && cmd.ExecutionIDJSON
+		},
+		gen.Identifier(),
+	))
+
+	// Property: v4 and v5 flags can be used together
+	properties.Property("v4 and v5 flags can coexist", prop.ForAll(
+		func(target string) bool {
+			if target == "" {
+				return true
+			}
+			args := []string{"run", "--execution-id", "--snapshot", target}
+			cmd, err := ParseArgs(args)
+			if err != nil {
+				return false
+			}
+			return cmd.Target == target && cmd.ExecutionID && cmd.Snapshot
+		},
+		gen.Identifier(),
+	))
+
+	properties.TestingRun(t)
+}

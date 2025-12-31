@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"admit/internal/artifact"
 	"admit/internal/cli"
@@ -15,6 +17,7 @@ import (
 	"admit/internal/launcher"
 	"admit/internal/resolver"
 	"admit/internal/schema"
+	"admit/internal/snapshot"
 	"admit/internal/validator"
 )
 
@@ -32,6 +35,15 @@ func run(args []string, environ []string, defaultSchemaDir string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
+	}
+
+	// Handle v5 subcommands that don't need schema validation
+	if cmd.Subcommand == cli.SubcommandSnapshots {
+		return runSnapshots(cmd, environ)
+	}
+
+	if cmd.Subcommand == cli.SubcommandReplay {
+		return runReplay(cmd, environ)
 	}
 
 	// Resolve schema path
@@ -265,6 +277,40 @@ func run(args []string, environ []string, defaultSchemaDir string) int {
 		}
 	}
 
+	// Handle v5 snapshot storage
+	if cmd.Snapshot {
+		schemaKeys := getSchemaKeys(s)
+		execID := execid.ComputeExecutionID(art.ConfigVersion, cmd.Target, cmd.Args, environ, schemaKeys)
+
+		// Build environment map from schema-referenced vars
+		envMap := make(map[string]string)
+		for _, key := range schemaKeys {
+			envVar := strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
+			for _, env := range environ {
+				if strings.HasPrefix(env, envVar+"=") {
+					envMap[envVar] = strings.TrimPrefix(env, envVar+"=")
+					break
+				}
+			}
+		}
+
+		snap := snapshot.ExecutionSnapshot{
+			ExecutionID:   execID.ExecutionID,
+			ConfigVersion: art.ConfigVersion,
+			Command:       cmd.Target,
+			Args:          cmd.Args,
+			Environment:   envMap,
+			SchemaPath:    schemaPath,
+			Timestamp:     time.Now().UTC(),
+		}
+
+		store := snapshot.NewStore(snapshot.ResolveDir(environ))
+		if _, err := store.Save(snap); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: cannot save snapshot: %v\n", err)
+			return 1
+		}
+	}
+
 	// If valid: exec target command (silent success)
 	// Note: Exec replaces the process, so this only returns on error
 	err = launcher.Exec(cmd, environ)
@@ -416,4 +462,147 @@ func getSchemaKeys(s schema.Schema) []string {
 		keys = append(keys, key)
 	}
 	return keys
+}
+
+// runSnapshots handles the snapshots subcommand.
+func runSnapshots(cmd cli.Command, environ []string) int {
+	store := snapshot.NewStore(snapshot.ResolveDir(environ))
+
+	// Handle --delete flag
+	if cmd.DeleteID != "" {
+		if err := store.Delete(cmd.DeleteID); err != nil {
+			if err == snapshot.ErrSnapshotNotFound {
+				fmt.Fprintf(os.Stderr, "Error: snapshot not found: %s\n", cmd.DeleteID)
+				return 4
+			}
+			fmt.Fprintf(os.Stderr, "Error: cannot delete snapshot: %v\n", err)
+			return 1
+		}
+		fmt.Printf("Deleted snapshot: %s\n", cmd.DeleteID)
+		return 0
+	}
+
+	// Handle --prune flag
+	if cmd.PruneDays > 0 {
+		duration := time.Duration(cmd.PruneDays) * 24 * time.Hour
+		deleted, err := store.Prune(duration)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: cannot prune snapshots: %v\n", err)
+			return 1
+		}
+		fmt.Printf("Pruned %d snapshot(s) older than %d days\n", deleted, cmd.PruneDays)
+		return 0
+	}
+
+	// List snapshots
+	summaries, err := store.List()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot list snapshots: %v\n", err)
+		return 1
+	}
+
+	if len(summaries) == 0 {
+		if cmd.JSONOutput {
+			fmt.Println("[]")
+		} else {
+			fmt.Println("No snapshots found")
+		}
+		return 0
+	}
+
+	if cmd.JSONOutput {
+		data, err := json.MarshalIndent(summaries, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: cannot serialize snapshots: %v\n", err)
+			return 1
+		}
+		fmt.Println(string(data))
+	} else {
+		for _, s := range summaries {
+			fmt.Printf("%s  %s  %s\n", s.ExecutionID, s.Command, s.Timestamp.Format(time.RFC3339))
+		}
+	}
+
+	return 0
+}
+
+// runReplay handles the replay subcommand.
+func runReplay(cmd cli.Command, environ []string) int {
+	store := snapshot.NewStore(snapshot.ResolveDir(environ))
+
+	// Load snapshot
+	snap, err := store.Load(cmd.ReplayID)
+	if err != nil {
+		if err == snapshot.ErrSnapshotNotFound {
+			fmt.Fprintf(os.Stderr, "Error: snapshot not found: %s\n", cmd.ReplayID)
+			return 4
+		}
+		fmt.Fprintf(os.Stderr, "Error: cannot load snapshot: %v\n", err)
+		return 1
+	}
+
+	// Get schema keys for verification (from snapshot environment keys)
+	var schemaKeys []string
+	for k := range snap.Environment {
+		// Convert env var back to schema key (e.g., DB_URL -> db.url)
+		key := strings.ToLower(strings.ReplaceAll(k, "_", "."))
+		schemaKeys = append(schemaKeys, key)
+	}
+
+	// Verify snapshot integrity
+	verifyResult := snapshot.Verify(snap, schemaKeys)
+	if verifyResult.IDMismatch {
+		fmt.Fprintln(os.Stderr, "Warning: snapshot may be corrupted (execution ID mismatch)")
+	}
+	if verifyResult.SchemaChanged {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", verifyResult.SchemaMessage)
+	}
+
+	// Handle --json flag
+	if cmd.JSONOutput {
+		data, err := json.MarshalIndent(snap, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: cannot serialize snapshot: %v\n", err)
+			return 1
+		}
+		fmt.Println(string(data))
+		return 0
+	}
+
+	// Handle --dry-run flag
+	if cmd.DryRun {
+		fmt.Printf("Would execute: %s %s\n", snap.Command, strings.Join(snap.Args, " "))
+		fmt.Println("With environment:")
+		for k, v := range snap.Environment {
+			fmt.Printf("  %s=%s\n", k, v)
+		}
+		return 0
+	}
+
+	// Restore environment from snapshot
+	for k, v := range snap.Environment {
+		environ = append(environ, k+"="+v)
+	}
+
+	// Execute the command
+	replayCmd := cli.Command{
+		Target: snap.Command,
+		Args:   snap.Args,
+	}
+
+	err = launcher.Exec(replayCmd, environ)
+	if err != nil {
+		if launcher.IsNotFound(err) {
+			fmt.Fprintf(os.Stderr, "Error: command not found: %s\n", snap.Command)
+			return 127
+		}
+		if launcher.IsPermissionDenied(err) {
+			fmt.Fprintf(os.Stderr, "Error: permission denied: %s\n", snap.Command)
+			return 126
+		}
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	return 0
 }

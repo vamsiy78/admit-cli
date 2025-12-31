@@ -2567,3 +2567,516 @@ func TestV4_ExecutionIDDeterminism(t *testing.T) {
 		t.Errorf("Expected deterministic execution IDs, got: %s, %s, %s", id1, id2, id3)
 	}
 }
+
+// ============================================================================
+// V5 Integration Tests - Execution Replay
+// ============================================================================
+
+// TestV5_SnapshotCreation tests that --snapshot creates a snapshot file
+func TestV5_SnapshotCreation(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	snapshotDir := filepath.Join(tmpDir, "snapshots")
+	markerFile := filepath.Join(tmpDir, "marker.txt")
+
+	cmd := exec.Command(binPath, "run", "--snapshot", "sh", "-c", "echo done > "+markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected command to succeed, got error: %v", err)
+	}
+
+	// Verify marker file was created (command executed)
+	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
+		t.Error("Expected marker file to be created")
+	}
+
+	// Verify snapshot directory was created
+	if _, err := os.Stat(snapshotDir); os.IsNotExist(err) {
+		t.Error("Expected snapshot directory to be created")
+	}
+
+	// Verify at least one snapshot file exists
+	entries, err := os.ReadDir(snapshotDir)
+	if err != nil {
+		t.Fatalf("Failed to read snapshot dir: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Error("Expected at least one snapshot file")
+	}
+}
+
+// TestV5_SnapshotsList tests the snapshots subcommand
+func TestV5_SnapshotsList(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	snapshotDir := filepath.Join(tmpDir, "snapshots")
+
+	// First create a snapshot
+	cmd := exec.Command(binPath, "run", "--snapshot", "true")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+	cmd.Run()
+
+	// Now list snapshots
+	cmd = exec.Command(binPath, "snapshots")
+	cmd.Env = []string{
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected snapshots command to succeed, got error: %v", err)
+	}
+
+	output := stdout.String()
+	if !bytes.Contains([]byte(output), []byte("sha256:")) {
+		t.Errorf("Expected snapshot listing to contain execution ID, got: %s", output)
+	}
+}
+
+// TestV5_SnapshotsListJSON tests the snapshots --json subcommand
+func TestV5_SnapshotsListJSON(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	snapshotDir := filepath.Join(tmpDir, "snapshots")
+
+	// First create a snapshot
+	cmd := exec.Command(binPath, "run", "--snapshot", "true")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+	cmd.Run()
+
+	// Now list snapshots as JSON
+	cmd = exec.Command(binPath, "snapshots", "--json")
+	cmd.Env = []string{
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected snapshots --json to succeed, got error: %v", err)
+	}
+
+	output := stdout.String()
+	if !bytes.Contains([]byte(output), []byte(`"executionId"`)) {
+		t.Errorf("Expected JSON output with executionId, got: %s", output)
+	}
+	if !bytes.Contains([]byte(output), []byte(`"command"`)) {
+		t.Errorf("Expected JSON output with command, got: %s", output)
+	}
+}
+
+// TestV5_SnapshotsEmpty tests snapshots command with no snapshots
+func TestV5_SnapshotsEmpty(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	snapshotDir := t.TempDir()
+
+	cmd := exec.Command(binPath, "snapshots")
+	cmd.Env = []string{
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected snapshots command to succeed, got error: %v", err)
+	}
+
+	output := stdout.String()
+	if !bytes.Contains([]byte(output), []byte("No snapshots found")) {
+		t.Errorf("Expected 'No snapshots found' message, got: %s", output)
+	}
+}
+
+// TestV5_ReplayDryRun tests replay --dry-run
+func TestV5_ReplayDryRun(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	snapshotDir := filepath.Join(tmpDir, "snapshots")
+
+	// First create a snapshot - use true command to avoid output mixing
+	cmd := exec.Command(binPath, "run", "--snapshot", "--execution-id", "true")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var createStdout bytes.Buffer
+	cmd.Stdout = &createStdout
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Failed to create snapshot: %v", err)
+	}
+
+	// Get the execution ID from output (first line)
+	execID := string(bytes.TrimSpace(createStdout.Bytes()))
+
+	// Now replay with --dry-run
+	cmd = exec.Command(binPath, "replay", "--dry-run", execID)
+	cmd.Env = []string{
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err = cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected replay --dry-run to succeed, got error: %v", err)
+	}
+
+	output := stdout.String()
+	if !bytes.Contains([]byte(output), []byte("Would execute:")) {
+		t.Errorf("Expected 'Would execute:' in output, got: %s", output)
+	}
+	if !bytes.Contains([]byte(output), []byte("true")) {
+		t.Errorf("Expected command 'true' in output, got: %s", output)
+	}
+}
+
+// TestV5_ReplayJSON tests replay --json
+func TestV5_ReplayJSON(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	snapshotDir := filepath.Join(tmpDir, "snapshots")
+
+	// First create a snapshot - use true command to avoid output mixing
+	cmd := exec.Command(binPath, "run", "--snapshot", "--execution-id", "true")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var createStdout bytes.Buffer
+	cmd.Stdout = &createStdout
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Failed to create snapshot: %v", err)
+	}
+
+	execID := string(bytes.TrimSpace(createStdout.Bytes()))
+
+	// Now replay with --json
+	cmd = exec.Command(binPath, "replay", "--json", execID)
+	cmd.Env = []string{
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err = cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected replay --json to succeed, got error: %v", err)
+	}
+
+	output := stdout.String()
+	if !bytes.Contains([]byte(output), []byte(`"executionId"`)) {
+		t.Errorf("Expected JSON with executionId, got: %s", output)
+	}
+	if !bytes.Contains([]byte(output), []byte(`"command"`)) {
+		t.Errorf("Expected JSON with command, got: %s", output)
+	}
+	if !bytes.Contains([]byte(output), []byte(`"environment"`)) {
+		t.Errorf("Expected JSON with environment, got: %s", output)
+	}
+}
+
+// TestV5_ReplayNotFound tests replay with non-existent snapshot
+func TestV5_ReplayNotFound(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	snapshotDir := t.TempDir()
+
+	cmd := exec.Command(binPath, "replay", "sha256:nonexistent")
+	cmd.Env = []string{
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Error("Expected replay to fail for non-existent snapshot")
+	}
+
+	// Check exit code is 4
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 4 {
+			t.Errorf("Expected exit code 4 for snapshot not found, got %d", exitErr.ExitCode())
+		}
+	}
+
+	// Stderr should contain error message
+	if !bytes.Contains(stderr.Bytes(), []byte("snapshot not found")) {
+		t.Errorf("Expected 'snapshot not found' in stderr, got: %s", stderr.String())
+	}
+}
+
+// TestV5_SnapshotsDelete tests snapshot deletion
+func TestV5_SnapshotsDelete(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	snapshotDir := filepath.Join(tmpDir, "snapshots")
+
+	// First create a snapshot
+	cmd := exec.Command(binPath, "run", "--snapshot", "--execution-id", "true")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var createStdout bytes.Buffer
+	cmd.Stdout = &createStdout
+	cmd.Run()
+
+	execID := string(bytes.TrimSpace(createStdout.Bytes()))
+
+	// Verify snapshot exists
+	cmd = exec.Command(binPath, "snapshots")
+	cmd.Env = []string{
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+	}
+	var listStdout bytes.Buffer
+	cmd.Stdout = &listStdout
+	cmd.Run()
+
+	if !bytes.Contains(listStdout.Bytes(), []byte(execID)) {
+		t.Fatalf("Snapshot should exist before deletion")
+	}
+
+	// Delete the snapshot
+	cmd = exec.Command(binPath, "snapshots", "--delete", execID)
+	cmd.Env = []string{
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+	}
+
+	var deleteStdout bytes.Buffer
+	cmd.Stdout = &deleteStdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected delete to succeed, got error: %v", err)
+	}
+
+	if !bytes.Contains(deleteStdout.Bytes(), []byte("Deleted snapshot")) {
+		t.Errorf("Expected 'Deleted snapshot' message, got: %s", deleteStdout.String())
+	}
+
+	// Verify snapshot is gone
+	cmd = exec.Command(binPath, "snapshots")
+	cmd.Env = []string{
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+	}
+	listStdout.Reset()
+	cmd.Stdout = &listStdout
+	cmd.Run()
+
+	if bytes.Contains(listStdout.Bytes(), []byte(execID)) {
+		t.Error("Snapshot should be deleted")
+	}
+}
+
+// TestV5_SnapshotsDeleteNotFound tests deleting non-existent snapshot
+func TestV5_SnapshotsDeleteNotFound(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	snapshotDir := t.TempDir()
+
+	cmd := exec.Command(binPath, "snapshots", "--delete", "sha256:nonexistent")
+	cmd.Env = []string{
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+	}
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Error("Expected delete to fail for non-existent snapshot")
+	}
+
+	// Check exit code is 4
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 4 {
+			t.Errorf("Expected exit code 4 for snapshot not found, got %d", exitErr.ExitCode())
+		}
+	}
+}
+
+// TestV5_BackwardCompatibility tests that v4 behavior is unchanged without v5 flags
+func TestV5_BackwardCompatibility(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "marker.txt")
+
+	// Run without any v5 flags
+	cmd := exec.Command(binPath, "run", "--execution-id", "sh", "-c", "echo done > "+markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected command to succeed, got error: %v", err)
+	}
+
+	// Verify marker file was created
+	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
+		t.Error("Expected marker file to be created")
+	}
+
+	// Verify execution ID was output
+	output := stdout.String()
+	if !bytes.Contains([]byte(output), []byte("sha256:")) {
+		t.Errorf("Expected execution ID in output, got: %s", output)
+	}
+}
+
+// TestV5_SnapshotWithExecutionID tests that --snapshot works with --execution-id
+func TestV5_SnapshotWithExecutionID(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	snapshotDir := filepath.Join(tmpDir, "snapshots")
+
+	cmd := exec.Command(binPath, "run", "--snapshot", "--execution-id", "true")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"ADMIT_SNAPSHOT_DIR=" + snapshotDir,
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected command to succeed, got error: %v", err)
+	}
+
+	// Verify execution ID was output
+	execID := string(bytes.TrimSpace(stdout.Bytes()))
+	if !bytes.Contains([]byte(execID), []byte("sha256:")) {
+		t.Errorf("Expected execution ID in output, got: %s", execID)
+	}
+
+	// Verify snapshot was created with that ID
+	entries, _ := os.ReadDir(snapshotDir)
+	if len(entries) != 1 {
+		t.Errorf("Expected exactly 1 snapshot, got %d", len(entries))
+	}
+}

@@ -665,6 +665,132 @@ All v4 features are opt-in. Without new flags, admit behaves exactly as v3:
 admit run node server.js
 ```
 
+## V5 Features: Execution Replay
+
+V5 adds execution replay - the ability to store execution snapshots and replay them later. This eliminates "works on my machine" problems and enables reproducible debugging.
+
+### Why Execution Replay?
+
+- **Reproducible debugging**: Replay any past execution with exact same config and environment
+- **Incident investigation**: Capture production execution context for later analysis
+- **Audit compliance**: Store proof of what exactly ran with what configuration
+
+### Snapshot Storage
+
+Store execution snapshots with the `--snapshot` flag:
+
+```bash
+# Store snapshot during execution
+admit run --snapshot node server.js
+
+# Snapshot is stored at ~/.admit/snapshots/{execution_id}.json
+# Or use ADMIT_SNAPSHOT_DIR to customize location
+ADMIT_SNAPSHOT_DIR=/var/log/admit/snapshots admit run --snapshot node server.js
+```
+
+Snapshot content:
+```json
+{
+  "executionId": "sha256:a1b2c3d4...",
+  "configVersion": "sha256:def456...",
+  "command": "node",
+  "args": ["server.js"],
+  "environment": {
+    "DB_URL": "postgres://localhost/mydb",
+    "PAYMENTS_MODE": "test"
+  },
+  "schemaPath": "/app/admit.yaml",
+  "timestamp": "2025-12-31T10:30:00Z"
+}
+```
+
+### Replay Subcommand
+
+Replay a stored execution:
+
+```bash
+# Replay an execution by ID
+admit replay sha256:a1b2c3d4...
+
+# Preview what would be executed (dry-run)
+admit replay --dry-run sha256:a1b2c3d4...
+# Output:
+# Would execute: node server.js
+# With environment:
+#   DB_URL=postgres://localhost/mydb
+#   PAYMENTS_MODE=test
+
+# Get snapshot as JSON
+admit replay --json sha256:a1b2c3d4...
+```
+
+### Snapshot Management
+
+List and manage stored snapshots:
+
+```bash
+# List all snapshots
+admit snapshots
+# Output:
+# sha256:a1b2c3d4...  node  2025-12-31T10:30:00Z
+# sha256:e5f6g7h8...  python  2025-12-30T15:45:00Z
+
+# List as JSON
+admit snapshots --json
+
+# Delete a specific snapshot
+admit snapshots --delete sha256:a1b2c3d4...
+
+# Prune snapshots older than 30 days
+admit snapshots --prune 30
+```
+
+### Snapshot Directory Configuration
+
+```bash
+# Default location
+~/.admit/snapshots/
+
+# Custom location via environment variable
+ADMIT_SNAPSHOT_DIR=/var/log/admit/snapshots admit run --snapshot node server.js
+
+# Snapshots are stored as {execution_id}.json
+# The ':' in execution IDs is replaced with '_' for filesystem compatibility
+```
+
+### Snapshot Verification
+
+When replaying, admit verifies snapshot integrity:
+
+```bash
+admit replay sha256:a1b2c3d4...
+# Warning: snapshot may be corrupted (execution ID mismatch)
+# Warning: schema file no longer exists
+```
+
+Verification checks:
+- Execution ID matches computed ID from snapshot contents
+- Schema file still exists at original path
+
+### Combining with Other Features
+
+```bash
+# Store snapshot and output execution ID
+admit run --snapshot --execution-id node server.js
+
+# Store snapshot with all v4 features
+admit run --snapshot --execution-id-json --artifact-file /tmp/config.json node server.js
+```
+
+### Backward Compatibility
+
+All v5 features are opt-in. Without new flags, admit behaves exactly as v4:
+
+```bash
+# Standard v4 behavior - no snapshots stored
+admit run node server.js
+```
+
 ## Exit Codes
 
 | Code | Meaning |
@@ -673,6 +799,7 @@ admit run node server.js
 | 1 | Validation failed |
 | 2 | Invariant violation (v2+) |
 | 3 | Schema error (file not found, parse error) (v3+) |
+| 4 | Snapshot not found (v5+) |
 | 126 | Command found but permission denied |
 | 127 | Command not found |
 | N | Exit code from the executed command |
@@ -763,6 +890,12 @@ admit/
 │   │   ├── types.go             # Schema data structures
 │   │   ├── parser.go            # YAML parsing and serialization
 │   │   └── parser_test.go       # Round-trip and invalid YAML tests
+│   ├── snapshot/
+│   │   ├── types.go             # V5 snapshot data structures
+│   │   ├── store.go             # Snapshot storage operations
+│   │   ├── store_test.go        # Store property tests
+│   │   ├── verify.go            # Snapshot integrity verification
+│   │   └── verify_test.go       # Verification tests
 │   └── validator/
 │       ├── validator.go         # Validation logic
 │       ├── validator_test.go    # Validation property tests
@@ -984,6 +1117,21 @@ The implementation is validated by 48 property-based tests using [gopter](https:
 | 8 | Execution ID Injection | Req 4.5 |
 | 9 | JSON Output Includes Execution ID | Req 5.3, 5.4 |
 | 10 | Backward Compatibility | Req 6.1, 6.2, 6.3 |
+
+### V5 Properties (Execution Replay)
+
+| # | Property | Validates |
+|---|----------|-----------|
+| 1 | Snapshot Storage | Req 1.1, 1.4, 1.5 |
+| 2 | Snapshot Directory Configuration | Req 1.2, 1.3 |
+| 3 | Snapshot JSON Structure | Req 2.1-2.8 |
+| 4 | Replay Execution | Req 3.1, 3.2, 3.3 |
+| 5 | Replay Missing Snapshot Error | Req 3.4 |
+| 6 | Replay Dry Run | Req 3.5, 3.6 |
+| 7 | Snapshot Listing | Req 4.1, 4.2, 4.3 |
+| 8 | Snapshot Cleanup | Req 5.1, 5.2 |
+| 9 | Snapshot Integrity Verification | Req 6.1, 6.2, 6.3, 6.4 |
+| 10 | Backward Compatibility | Req 7.1, 7.2, 7.3 |
 
 Each property test runs 100 iterations with randomly generated inputs.
 
