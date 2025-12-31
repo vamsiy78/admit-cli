@@ -360,3 +360,48 @@ func TestParseArgs_FlagErrors(t *testing.T) {
 		})
 	}
 }
+
+
+// TestParseArgs_InvariantsJSONFlag tests the --invariants-json flag
+func TestParseArgs_InvariantsJSONFlag(t *testing.T) {
+	tests := []struct {
+		name               string
+		args               []string
+		wantTarget         string
+		wantInvariantsJSON bool
+	}{
+		{
+			name:               "invariants-json flag",
+			args:               []string{"run", "--invariants-json", "echo"},
+			wantTarget:         "echo",
+			wantInvariantsJSON: true,
+		},
+		{
+			name:               "invariants-json with other flags",
+			args:               []string{"run", "--invariants-json", "--artifact-stdout", "node", "app.js"},
+			wantTarget:         "node",
+			wantInvariantsJSON: true,
+		},
+		{
+			name:               "no invariants-json flag",
+			args:               []string{"run", "echo"},
+			wantTarget:         "echo",
+			wantInvariantsJSON: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, err := ParseArgs(tt.args)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cmd.Target != tt.wantTarget {
+				t.Errorf("Target = %q, want %q", cmd.Target, tt.wantTarget)
+			}
+			if cmd.InvariantsJSON != tt.wantInvariantsJSON {
+				t.Errorf("InvariantsJSON = %v, want %v", cmd.InvariantsJSON, tt.wantInvariantsJSON)
+			}
+		})
+	}
+}

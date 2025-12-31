@@ -3,11 +3,13 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"admit/internal/artifact"
 	"admit/internal/cli"
 	"admit/internal/identity"
 	"admit/internal/injector"
+	"admit/internal/invariant"
 	"admit/internal/launcher"
 	"admit/internal/resolver"
 	"admit/internal/schema"
@@ -50,6 +52,47 @@ func run(args []string, environ []string, schemaDir string) int {
 			fmt.Fprintln(os.Stderr, validator.FormatError(verr))
 		}
 		return 1
+	}
+
+	// Evaluate invariants (v2 feature)
+	// Skip if no invariants defined (backward compatibility)
+	if len(s.Invariants) > 0 {
+		// Build config values map from resolved values
+		configValues := make(map[string]string)
+		for _, rv := range resolved {
+			if rv.Present {
+				configValues[rv.Key] = rv.Value
+			}
+		}
+
+		// Build evaluation context
+		evalCtx := invariant.EvalContext{
+			ConfigValues: configValues,
+			ExecutionEnv: getAdmitEnv(environ),
+		}
+
+		// Evaluate all invariants
+		invResults := invariant.EvaluateAll(s.Invariants, evalCtx)
+
+		// Handle --invariants-json flag
+		if cmd.InvariantsJSON {
+			jsonOutput, err := invariant.FormatJSON(invResults)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: cannot format invariant results: %v\n", err)
+				return 1
+			}
+			fmt.Println(jsonOutput)
+		}
+
+		// Check for violations
+		if invariant.HasViolations(invResults) {
+			// Report all violations to stderr (unless JSON mode already printed)
+			if !cmd.InvariantsJSON {
+				fmt.Fprint(os.Stderr, invariant.FormatViolations(invResults))
+			}
+			// Exit with code 2 for invariant violations
+			return 2
+		}
 	}
 
 	// Generate config artifact (always generated after successful validation)
@@ -138,4 +181,15 @@ func run(args []string, environ []string, schemaDir string) int {
 
 	// This line should never be reached if Exec succeeds
 	return 0
+}
+
+
+// getAdmitEnv extracts the ADMIT_ENV value from the environment slice
+func getAdmitEnv(environ []string) string {
+	for _, env := range environ {
+		if strings.HasPrefix(env, "ADMIT_ENV=") {
+			return strings.TrimPrefix(env, "ADMIT_ENV=")
+		}
+	}
+	return ""
 }

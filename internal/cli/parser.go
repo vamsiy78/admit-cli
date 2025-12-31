@@ -32,6 +32,9 @@ type Command struct {
 	Identity      bool   // --identity
 	IdentityFile  string // --identity-file <path>
 	IdentityShort bool   // --identity-short
+
+	// Invariant flags
+	InvariantsJSON bool // --invariants-json
 }
 
 // ParseArgs parses CLI arguments into a Command.
@@ -93,6 +96,8 @@ func ParseArgs(args []string) (Command, error) {
 				cmd.IdentityFile = args[i]
 			case "identity-short":
 				cmd.IdentityShort = true
+			case "invariants-json":
+				cmd.InvariantsJSON = true
 			default:
 				// Unknown flag - treat as start of command
 				break

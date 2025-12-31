@@ -207,12 +207,137 @@ All v1 features are opt-in. Without any new flags, admit behaves exactly as v0:
 admit run node server.js
 ```
 
+## V2 Features: Runtime Invariants
+
+Invariants are declarative rules that enforce cross-configuration constraints at execution time. They prevent catastrophic misconfigurations like connecting to production databases in non-production environments.
+
+### Declaring Invariants
+
+Add an `invariants` section to your `admit.yaml`:
+
+```yaml
+config:
+  db.url:
+    type: string
+    required: true
+  db.url.env:
+    type: enum
+    values: [dev, staging, prod]
+    required: true
+  payments.mode:
+    type: enum
+    values: [sandbox, live]
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+  
+  - name: payments-flag-guard
+    rule: execution.env != "prod" => payments.mode != "live"
+  
+  - name: staging-isolation
+    rule: execution.env == "staging" => db.url.env == "staging"
+```
+
+### Rule Expression Syntax
+
+Invariant rules support:
+
+- **Implication**: `A => B` or `A ⇒ B` (if A is true, then B must be true)
+- **Equality**: `A == B` (values must match)
+- **Inequality**: `A != B` (values must differ)
+- **Config references**: Dot-notation paths like `db.url.env`
+- **Execution environment**: `execution.env` (reads from `ADMIT_ENV`)
+- **String literals**: Quoted strings like `"prod"`
+
+### Execution Environment
+
+Set `ADMIT_ENV` to specify the execution environment:
+
+```bash
+# Production environment - invariants will enforce prod constraints
+ADMIT_ENV=prod DB_URL="..." DB_URL_ENV=prod admit run node server.js
+
+# Development environment - more relaxed constraints
+ADMIT_ENV=dev DB_URL="..." DB_URL_ENV=dev admit run node server.js
+```
+
+### Invariant Violations
+
+When an invariant fails, admit blocks execution and reports the violation:
+
+```bash
+ADMIT_ENV=prod DB_URL="postgres://staging-db/app" DB_URL_ENV=staging admit run node server.js
+# Output:
+# INVARIANT VIOLATION: 'prod-db-guard'
+#   Rule: execution.env == "prod" => db.url.env == "prod"
+#   execution.env is "prod" but db.url.env is "staging" (expected "prod")
+```
+
+Multiple violations are all reported before exiting:
+
+```bash
+# Output:
+# INVARIANT VIOLATION: 'prod-db-guard'
+#   Rule: execution.env == "prod" => db.url.env == "prod"
+#   ...
+# INVARIANT VIOLATION: 'payments-flag-guard'
+#   Rule: execution.env != "prod" => payments.mode != "live"
+#   ...
+```
+
+### JSON Output
+
+Get invariant results as JSON for programmatic processing:
+
+```bash
+admit run --invariants-json node server.js
+```
+
+Output:
+```json
+{
+  "invariants": [
+    {
+      "name": "prod-db-guard",
+      "rule": "execution.env == \"prod\" => db.url.env == \"prod\"",
+      "passed": false,
+      "leftValue": "prod",
+      "rightValue": "staging",
+      "message": "Invariant 'prod-db-guard' failed: ..."
+    }
+  ],
+  "allPassed": false,
+  "failedCount": 1
+}
+```
+
+### Common Invariant Patterns
+
+| Scenario | Invariant Example |
+|----------|-------------------|
+| Wrong DB in prod | `execution.env == "prod" => db.url.env == "prod"` |
+| Accidental flag enable | `execution.env != "prod" => payments.mode != "live"` |
+| Region misconfigs | `execution.env == "prod" => region == "us-east-1"` |
+| Feature flag consistency | `feature.v2 == "enabled" => api.version == "v2"` |
+
+### Backward Compatibility
+
+Invariants are opt-in. Schemas without an `invariants` section work exactly as before:
+
+```bash
+# No invariants defined - just v0/v1 validation
+admit run node server.js
+```
+
 ## Exit Codes
 
 | Code | Meaning |
 |------|---------|
 | 0 | Validation passed, command executed successfully |
 | 1 | Validation failed or schema error |
+| 2 | Invariant violation (v2) |
 | 126 | Command found but permission denied |
 | 127 | Command not found |
 | N | Exit code from the executed command |
@@ -281,6 +406,14 @@ admit/
 │   ├── injector/
 │   │   ├── injector.go          # Runtime config injection
 │   │   └── injector_test.go     # Injection property tests
+│   ├── invariant/
+│   │   ├── types.go             # Invariant AST types
+│   │   ├── parser.go            # Rule expression parser
+│   │   ├── parser_test.go       # Parser property tests
+│   │   ├── evaluator.go         # Invariant evaluation logic
+│   │   ├── evaluator_test.go    # Evaluator property tests
+│   │   ├── reporter.go          # Violation message formatting
+│   │   └── reporter_test.go     # Reporter property tests
 │   ├── launcher/
 │   │   └── exec.go              # execve wrapper
 │   ├── resolver/
@@ -431,7 +564,7 @@ Coordinates the full execution flow:
 
 ## Correctness Properties
 
-The implementation is validated by 27 property-based tests using [gopter](https://github.com/leanovate/gopter):
+The implementation is validated by 38 property-based tests using [gopter](https://github.com/leanovate/gopter):
 
 ### Core Properties (v0)
 
@@ -469,6 +602,22 @@ The implementation is validated by 27 property-based tests using [gopter](https:
 | 11 | Hash Format Compliance | Req 5.4 |
 | 12 | Backward Compatibility | Req 6.1 |
 | 13 | Validation Before Artifacts | Req 6.2, 6.3 |
+
+### V2 Properties (Runtime Invariants)
+
+| # | Property | Validates |
+|---|----------|-----------|
+| 1 | Schema Parsing with Invariants | Req 1.1, 1.4, 1.5 |
+| 2 | Invariant Field Validation | Req 1.2, 1.3 |
+| 3 | Rule Expression Round-Trip | Req 2.1-2.5, 2.8, 2.9 |
+| 4 | Undefined Key Detection | Req 2.7 |
+| 5 | Implication Evaluation Semantics | Req 3.2 |
+| 6 | Equality/Inequality Evaluation | Req 3.3, 3.4 |
+| 7 | Invariant Execution Gate | Req 4.1, 4.2, 4.7 |
+| 8 | All Violations Reported | Req 4.6 |
+| 9 | Violation Output Completeness | Req 4.3-4.5, 5.1-5.3 |
+| 10 | JSON Output Format | Req 5.5 |
+| 11 | Backward Compatibility - No Invariants | Req 6.1, 6.4 |
 
 Each property test runs 100 iterations with randomly generated inputs.
 

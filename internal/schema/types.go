@@ -1,5 +1,7 @@
 package schema
 
+import "admit/internal/invariant"
+
 // ConfigType represents the type of a config value
 type ConfigType string
 
@@ -18,5 +20,6 @@ type ConfigKey struct {
 
 // Schema represents the full configuration schema
 type Schema struct {
-	Config map[string]ConfigKey
+	Config     map[string]ConfigKey
+	Invariants []invariant.Invariant
 }

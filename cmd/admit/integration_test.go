@@ -831,3 +831,720 @@ func TestInvalidConfigNoArtifacts(t *testing.T) {
 		t.Errorf("Inject file should not be created for invalid config")
 	}
 }
+
+
+// ============================================================================
+// V2 Integration Tests - Invariants
+// ============================================================================
+
+// TestInvariantPassing tests that execution proceeds when all invariants pass
+// Validates: Requirements 4.7
+func TestInvariantPassing(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url.env:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with matching env values (prod => prod) - invariant should pass
+	cmd := exec.Command(binPath, "run", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=prod",
+		"DB_URL_ENV=prod",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		t.Errorf("Expected command to succeed with passing invariant, got error: %v\nStderr: %s", err, stderr.String())
+	}
+
+	// Marker file should exist (command executed)
+	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
+		t.Errorf("Expected marker file to be created (command should have executed)")
+	}
+}
+
+// TestInvariantPassingWhenAntecedentFalse tests that implication passes when antecedent is false
+// Validates: Requirements 3.2, 4.7
+func TestInvariantPassingWhenAntecedentFalse(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url.env:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with non-prod env - antecedent is false, so implication passes
+	cmd := exec.Command(binPath, "run", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=dev",
+		"DB_URL_ENV=staging", // Doesn't matter since antecedent is false
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		t.Errorf("Expected command to succeed when antecedent is false, got error: %v\nStderr: %s", err, stderr.String())
+	}
+
+	// Marker file should exist (command executed)
+	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
+		t.Errorf("Expected marker file to be created (command should have executed)")
+	}
+}
+
+// TestInvariantFailing tests that execution is blocked when an invariant fails
+// Validates: Requirements 4.1, 4.2
+func TestInvariantFailing(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url.env:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with mismatched env values (prod => staging) - invariant should fail
+	cmd := exec.Command(binPath, "run", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=prod",
+		"DB_URL_ENV=staging", // Mismatch! Should fail
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Errorf("Expected command to fail with invariant violation")
+	}
+
+	// Check exit code is 2 (invariant violation)
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 2 {
+			t.Errorf("Expected exit code 2 for invariant violation, got %d", exitErr.ExitCode())
+		}
+	}
+
+	// Marker file should NOT exist (command should not have executed)
+	if _, err := os.Stat(markerFile); err == nil {
+		t.Errorf("Marker file should not exist (command should not have executed)")
+	}
+
+	// Stderr should contain violation message
+	stderrStr := stderr.String()
+	if !bytes.Contains([]byte(stderrStr), []byte("INVARIANT VIOLATION")) {
+		t.Errorf("Expected 'INVARIANT VIOLATION' in stderr, got: %s", stderrStr)
+	}
+	if !bytes.Contains([]byte(stderrStr), []byte("prod-db-guard")) {
+		t.Errorf("Expected invariant name 'prod-db-guard' in stderr, got: %s", stderrStr)
+	}
+}
+
+// TestMultipleInvariantFailures tests that all violations are reported when multiple invariants fail
+// Validates: Requirements 4.6
+func TestMultipleInvariantFailures(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url.env:
+    type: string
+    required: true
+  payments.mode:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+  - name: payments-guard
+    rule: execution.env == "prod" => payments.mode == "live"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with both invariants failing
+	cmd := exec.Command(binPath, "run", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=prod",
+		"DB_URL_ENV=staging",   // Fails prod-db-guard
+		"PAYMENTS_MODE=sandbox", // Fails payments-guard
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Errorf("Expected command to fail with invariant violations")
+	}
+
+	// Check exit code is 2 (invariant violation)
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 2 {
+			t.Errorf("Expected exit code 2 for invariant violation, got %d", exitErr.ExitCode())
+		}
+	}
+
+	// Marker file should NOT exist
+	if _, err := os.Stat(markerFile); err == nil {
+		t.Errorf("Marker file should not exist (command should not have executed)")
+	}
+
+	// Stderr should contain BOTH violation messages
+	stderrStr := stderr.String()
+	if !bytes.Contains([]byte(stderrStr), []byte("prod-db-guard")) {
+		t.Errorf("Expected 'prod-db-guard' violation in stderr, got: %s", stderrStr)
+	}
+	if !bytes.Contains([]byte(stderrStr), []byte("payments-guard")) {
+		t.Errorf("Expected 'payments-guard' violation in stderr, got: %s", stderrStr)
+	}
+	if !bytes.Contains([]byte(stderrStr), []byte("2 violation")) {
+		t.Errorf("Expected '2 violation' count in stderr, got: %s", stderrStr)
+	}
+}
+
+// TestInvariantJSONOutput tests the --invariants-json flag output
+// Validates: Requirements 5.5
+func TestInvariantJSONOutput(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url.env:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with --invariants-json flag and failing invariant
+	cmd := exec.Command(binPath, "run", "--invariants-json", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=prod",
+		"DB_URL_ENV=staging", // Mismatch - invariant fails
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Errorf("Expected command to fail with invariant violation")
+	}
+
+	// Stdout should contain JSON output
+	stdoutStr := stdout.String()
+	if !bytes.Contains([]byte(stdoutStr), []byte(`"invariants"`)) {
+		t.Errorf("Expected 'invariants' field in JSON output, got: %s", stdoutStr)
+	}
+	if !bytes.Contains([]byte(stdoutStr), []byte(`"allPassed"`)) {
+		t.Errorf("Expected 'allPassed' field in JSON output, got: %s", stdoutStr)
+	}
+	if !bytes.Contains([]byte(stdoutStr), []byte(`"failedCount"`)) {
+		t.Errorf("Expected 'failedCount' field in JSON output, got: %s", stdoutStr)
+	}
+	if !bytes.Contains([]byte(stdoutStr), []byte(`"prod-db-guard"`)) {
+		t.Errorf("Expected invariant name in JSON output, got: %s", stdoutStr)
+	}
+	if !bytes.Contains([]byte(stdoutStr), []byte(`"passed": false`)) {
+		t.Errorf("Expected 'passed: false' in JSON output, got: %s", stdoutStr)
+	}
+}
+
+// TestInvariantJSONOutputPassing tests the --invariants-json flag with passing invariants
+// Validates: Requirements 5.5
+func TestInvariantJSONOutputPassing(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url.env:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with --invariants-json flag and passing invariant
+	cmd := exec.Command(binPath, "run", "--invariants-json", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=prod",
+		"DB_URL_ENV=prod", // Match - invariant passes
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Errorf("Expected command to succeed with passing invariant, got error: %v", err)
+	}
+
+	// Stdout should contain JSON output with allPassed: true
+	stdoutStr := stdout.String()
+	if !bytes.Contains([]byte(stdoutStr), []byte(`"allPassed": true`)) {
+		t.Errorf("Expected 'allPassed: true' in JSON output, got: %s", stdoutStr)
+	}
+	if !bytes.Contains([]byte(stdoutStr), []byte(`"failedCount": 0`)) {
+		t.Errorf("Expected 'failedCount: 0' in JSON output, got: %s", stdoutStr)
+	}
+
+	// Marker file should exist (command executed)
+	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
+		t.Errorf("Expected marker file to be created (command should have executed)")
+	}
+}
+
+// TestInvariantWithV1Features tests that invariants work correctly with v1 features
+// Validates: Requirements 4.1, 4.2, 4.7
+func TestInvariantWithV1Features(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+  db.url.env:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	artifactPath := filepath.Join(tmpDir, "artifact.json")
+
+	// Run with passing invariant and artifact output
+	cmd := exec.Command(binPath, "run", "--artifact-file", artifactPath, "true")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=prod",
+		"DB_URL=postgres://localhost/prod",
+		"DB_URL_ENV=prod",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Command failed: %v", err)
+	}
+
+	// Artifact file should be created
+	content, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatalf("Failed to read artifact file: %v", err)
+	}
+
+	// Verify artifact contains expected fields
+	if !bytes.Contains(content, []byte(`"configVersion"`)) {
+		t.Errorf("Artifact missing configVersion field")
+	}
+	if !bytes.Contains(content, []byte(`"db.url"`)) {
+		t.Errorf("Artifact missing db.url value")
+	}
+}
+
+// TestInvariantFailureNoArtifacts tests that failing invariants prevent artifact creation
+// Validates: Requirements 4.1, 4.2
+func TestInvariantFailureNoArtifacts(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+  db.url.env:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	artifactPath := filepath.Join(tmpDir, "artifact.json")
+
+	// Run with failing invariant and artifact output
+	cmd := exec.Command(binPath, "run", "--artifact-file", artifactPath, "true")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=prod",
+		"DB_URL=postgres://localhost/staging",
+		"DB_URL_ENV=staging", // Mismatch - invariant fails
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Errorf("Expected command to fail with invariant violation")
+	}
+
+	// Artifact file should NOT be created when invariant fails
+	if _, err := os.Stat(artifactPath); err == nil {
+		t.Errorf("Artifact file should not be created when invariant fails")
+	}
+}
+
+// TestNoInvariantsBackwardCompatibility tests that schemas without invariants work normally
+// Validates: Requirements 6.1, 6.4
+func TestNoInvariantsBackwardCompatibility(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	// Schema without invariants section (v1 style)
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	cmd := exec.Command(binPath, "run", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+	if err != nil {
+		t.Errorf("Expected command to succeed without invariants, got error: %v", err)
+	}
+
+	// Marker file should exist (command executed)
+	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
+		t.Errorf("Expected marker file to be created (command should have executed)")
+	}
+}
+
+// TestEmptyInvariantsBackwardCompatibility tests that empty invariants section works normally
+// Validates: Requirements 6.2
+func TestEmptyInvariantsBackwardCompatibility(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	// Schema with empty invariants section
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+
+invariants: []
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	cmd := exec.Command(binPath, "run", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+	if err != nil {
+		t.Errorf("Expected command to succeed with empty invariants, got error: %v", err)
+	}
+
+	// Marker file should exist (command executed)
+	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
+		t.Errorf("Expected marker file to be created (command should have executed)")
+	}
+}
+
+// TestInvariantWithIdentity tests that invariants work with identity output
+// Validates: Requirements 4.7
+func TestInvariantWithIdentity(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+  db.url.env:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	// Run with passing invariant and identity output
+	cmd := exec.Command(binPath, "run", "--identity", "true")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=prod",
+		"DB_URL=postgres://localhost/prod",
+		"DB_URL_ENV=prod",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Command failed: %v", err)
+	}
+
+	// Stdout should contain identity JSON
+	stdoutStr := stdout.String()
+	if !bytes.Contains([]byte(stdoutStr), []byte(`"codeHash"`)) {
+		t.Errorf("Identity missing codeHash field")
+	}
+	if !bytes.Contains([]byte(stdoutStr), []byte(`"configHash"`)) {
+		t.Errorf("Identity missing configHash field")
+	}
+}
+
+// TestInvariantWithInjectEnv tests that invariants work with inject-env
+// Validates: Requirements 4.7
+func TestInvariantWithInjectEnv(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+  db.url.env:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	outputFile := filepath.Join(tmpDir, "config_output.txt")
+
+	// Run with passing invariant and inject-env
+	cmd := exec.Command(binPath, "run", "--inject-env", "ADMIT_CONFIG", "sh", "-c", "echo $ADMIT_CONFIG > "+outputFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=prod",
+		"DB_URL=postgres://localhost/prod",
+		"DB_URL_ENV=prod",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Command failed: %v", err)
+	}
+
+	// Read the output file
+	content, err := os.ReadFile(outputFile)
+	if err != nil {
+		t.Fatalf("Failed to read output file: %v", err)
+	}
+
+	// Verify it contains artifact JSON
+	if !bytes.Contains(content, []byte(`"configVersion"`)) {
+		t.Errorf("Injected env var missing configVersion")
+	}
+}
+
+// TestInvariantInequalityOperator tests the != operator in invariants
+// Validates: Requirements 3.4
+func TestInvariantInequalityOperator(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  payments.mode:
+    type: string
+    required: true
+
+invariants:
+  - name: no-live-in-dev
+    rule: execution.env != "prod" => payments.mode != "live"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Test case 1: dev env with sandbox mode - should pass
+	cmd := exec.Command(binPath, "run", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=dev",
+		"PAYMENTS_MODE=sandbox",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+	if err != nil {
+		t.Errorf("Expected command to succeed with dev/sandbox, got error: %v", err)
+	}
+
+	// Clean up marker
+	os.Remove(markerFile)
+
+	// Test case 2: dev env with live mode - should fail
+	cmd = exec.Command(binPath, "run", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=dev",
+		"PAYMENTS_MODE=live", // Violation!
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err = cmd.Run()
+	if err == nil {
+		t.Errorf("Expected command to fail with dev/live")
+	}
+
+	// Marker should not exist
+	if _, err := os.Stat(markerFile); err == nil {
+		t.Errorf("Marker file should not exist when invariant fails")
+	}
+}
+
+// TestInvariantV1ValidationFirst tests that v1 validation runs before invariants
+// Validates: Requirements 6.4
+func TestInvariantV1ValidationFirst(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+  db.url.env:
+    type: string
+    required: true
+
+invariants:
+  - name: prod-db-guard
+    rule: execution.env == "prod" => db.url.env == "prod"
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "executed.marker")
+
+	// Run with missing required field (v1 validation should fail first)
+	cmd := exec.Command(binPath, "run", "touch", markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"ADMIT_ENV=prod",
+		// Missing DB_URL - required field
+		"DB_URL_ENV=staging",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	// Should exit with error
+	if err == nil {
+		t.Errorf("Expected command to fail with missing required field")
+	}
+
+	// Check exit code is 1 (validation error, not 2 for invariant)
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 1 {
+			t.Errorf("Expected exit code 1 for validation error, got %d", exitErr.ExitCode())
+		}
+	}
+
+	// Stderr should contain validation error, not invariant violation
+	stderrStr := stderr.String()
+	if bytes.Contains([]byte(stderrStr), []byte("INVARIANT VIOLATION")) {
+		t.Errorf("Should not see invariant violation when v1 validation fails first")
+	}
+}
