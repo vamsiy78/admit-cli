@@ -2026,3 +2026,180 @@ invariants:
 
 	properties.TestingRun(t)
 }
+
+// Feature: admit-v4-execution-identity, Property 9: JSON Output Includes Execution ID
+// Validates: Requirements 5.3, 5.4
+// For any `admit check --json` or `admit run --dry-run --json` invocation,
+// the JSON output SHALL include an executionId field with a valid sha256-formatted hash.
+func TestJSONOutputIncludesExecutionID_Property(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	// Property: check --json includes executionId
+	properties.Property("check --json includes executionId", prop.ForAll(
+		func(dbUrl string) bool {
+			if dbUrl == "" {
+				dbUrl = "postgres://localhost/test"
+			}
+
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+			schemaPath := filepath.Join(tmpDir, "admit.yaml")
+			if err := os.WriteFile(schemaPath, []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			environ := []string{"DB_URL=" + dbUrl}
+
+			// Capture stdout
+			oldStdout := os.Stdout
+			r, w, _ := os.Pipe()
+			os.Stdout = w
+
+			exitCode := run([]string{"check", "--json"}, environ, tmpDir)
+
+			w.Close()
+			os.Stdout = oldStdout
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+			r.Close()
+
+			output := buf.String()
+
+			// Should exit 0 and include executionId
+			return exitCode == 0 &&
+				strings.Contains(output, `"executionId"`) &&
+				strings.Contains(output, `"sha256:`)
+		},
+		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 }),
+	))
+
+	// Property: dry-run --json includes executionId
+	properties.Property("dry-run --json includes executionId", prop.ForAll(
+		func(dbUrl string, command string) bool {
+			if dbUrl == "" || command == "" {
+				return true
+			}
+
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+			schemaPath := filepath.Join(tmpDir, "admit.yaml")
+			if err := os.WriteFile(schemaPath, []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			environ := []string{"DB_URL=" + dbUrl}
+
+			// Capture stdout
+			oldStdout := os.Stdout
+			r, w, _ := os.Pipe()
+			os.Stdout = w
+
+			exitCode := run([]string{"run", "--dry-run", "--json", command}, environ, tmpDir)
+
+			w.Close()
+			os.Stdout = oldStdout
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+			r.Close()
+
+			output := buf.String()
+
+			// Should exit 0 and include executionId
+			return exitCode == 0 &&
+				strings.Contains(output, `"executionId"`) &&
+				strings.Contains(output, `"sha256:`)
+		},
+		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 }),
+		gen.Identifier(),
+	))
+
+	// Property: executionId has valid sha256 format
+	properties.Property("executionId has valid sha256 format", prop.ForAll(
+		func(dbUrl string) bool {
+			if dbUrl == "" {
+				dbUrl = "postgres://localhost/test"
+			}
+
+			tmpDir, err := os.MkdirTemp("", "admit-test-*")
+			if err != nil {
+				return true
+			}
+			defer os.RemoveAll(tmpDir)
+
+			schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+			schemaPath := filepath.Join(tmpDir, "admit.yaml")
+			if err := os.WriteFile(schemaPath, []byte(schemaContent), 0644); err != nil {
+				return true
+			}
+
+			environ := []string{"DB_URL=" + dbUrl}
+
+			// Capture stdout
+			oldStdout := os.Stdout
+			r, w, _ := os.Pipe()
+			os.Stdout = w
+
+			_ = run([]string{"check", "--json"}, environ, tmpDir)
+
+			w.Close()
+			os.Stdout = oldStdout
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+			r.Close()
+
+			output := buf.String()
+
+			// Extract executionId and verify format
+			// Format should be sha256: followed by 64 hex chars
+			idx := strings.Index(output, `"executionId":"sha256:`)
+			if idx == -1 {
+				return false
+			}
+
+			// Check that there are 64 hex chars after sha256:
+			start := idx + len(`"executionId":"sha256:`)
+			if start+64 > len(output) {
+				return false
+			}
+
+			hexPart := output[start : start+64]
+			for _, c := range hexPart {
+				if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+					return false
+				}
+			}
+			return true
+		},
+		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 }),
+	))
+
+	properties.TestingRun(t)
+}

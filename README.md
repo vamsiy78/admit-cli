@@ -565,6 +565,106 @@ All v3 features are opt-in. Without new flags, admit behaves exactly as v2:
 admit run node server.js
 ```
 
+## V4 Features: Execution Identity
+
+V4 adds deterministic execution identity - a fingerprint for every execution that answers "what exactly ran?" with a single referenceable ID.
+
+### Why Execution Identity?
+
+- **Factual debugging**: Every execution has a unique, reproducible fingerprint
+- **Traceable rollbacks**: Know exactly what configuration ran in each deployment
+- **Audit compliance**: Content-addressable proof of execution context
+
+### Execution ID Computation
+
+The execution ID is computed from three components:
+
+```
+execution_id = sha256(config_version + command_hash + environment_hash)
+```
+
+- **config_version**: Hash of validated configuration values
+- **command_hash**: Hash of command and arguments
+- **environment_hash**: Hash of schema-referenced environment variables only
+
+### Basic Usage
+
+```bash
+# Output execution ID to stdout
+admit run --execution-id node server.js
+# Output: sha256:a1b2c3d4e5f6...
+
+# Output full execution identity as JSON
+admit run --execution-id-json node server.js
+# Output:
+# {
+#   "executionId": "sha256:a1b2c3d4...",
+#   "configVersion": "sha256:def456...",
+#   "commandHash": "sha256:789ghi...",
+#   "environmentHash": "sha256:jkl012...",
+#   "command": "node",
+#   "args": ["server.js"]
+# }
+
+# Write execution identity to file
+admit run --execution-id-file /var/log/admit/execid.json node server.js
+
+# Inject execution ID into environment variable
+admit run --execution-id-env EXEC_ID node server.js
+```
+
+### Execution ID in Check and Dry-Run Modes
+
+```bash
+# Get execution ID without running (check mode uses placeholder command hash)
+admit check --execution-id
+# Output: sha256:...
+
+# Get execution ID in dry-run mode
+admit run --dry-run --execution-id node server.js
+# Output: sha256:...
+
+# JSON output includes execution ID
+admit check --json
+# Output includes "executionId": "sha256:..."
+
+admit run --dry-run --json node server.js
+# Output includes "executionId": "sha256:..."
+```
+
+### Combining with V1 Identity
+
+V4 execution identity is independent of V1 identity (they serve different purposes):
+
+- **V1 identity**: Hashes executable file content + config values
+- **V4 execution ID**: Hashes config + command + arguments + relevant environment
+
+Both can be used together:
+
+```bash
+admit run --identity --execution-id node server.js
+# Outputs both V1 identity JSON and V4 execution ID
+```
+
+### Determinism Guarantees
+
+The execution ID is fully deterministic:
+
+- Same config values → same config_version
+- Same command and arguments → same command_hash
+- Same schema-referenced environment variables → same environment_hash
+- No timestamps, process IDs, or random values included
+- Only environment variables referenced by the schema affect the hash
+
+### Backward Compatibility
+
+All v4 features are opt-in. Without new flags, admit behaves exactly as v3:
+
+```bash
+# Standard v3 behavior - validation, invariants, then exec
+admit run node server.js
+```
+
 ## Exit Codes
 
 | Code | Meaning |
@@ -635,8 +735,11 @@ admit/
 │   ├── cli/
 │   │   ├── parser.go            # CLI argument parsing
 │   │   └── parser_test.go       # Argument preservation property tests
+│   ├── execid/
+│   │   ├── execid.go            # V4 execution identity generation
+│   │   └── execid_test.go       # Execution identity property tests
 │   ├── identity/
-│   │   ├── identity.go          # Execution identity generation
+│   │   ├── identity.go          # V1 execution identity generation
 │   │   └── identity_test.go     # Identity property tests
 │   ├── injector/
 │   │   ├── injector.go          # Runtime config injection
@@ -799,7 +902,7 @@ Coordinates the full execution flow:
 
 ## Correctness Properties
 
-The implementation is validated by 38 property-based tests using [gopter](https://github.com/leanovate/gopter):
+The implementation is validated by 48 property-based tests using [gopter](https://github.com/leanovate/gopter):
 
 ### Core Properties (v0)
 
@@ -866,6 +969,21 @@ The implementation is validated by 38 property-based tests using [gopter](https:
 | 6 | Exit Code Consistency | Req 3.2-3.4, 7.4 |
 | 7 | Backward Compatibility | Req 7.1-7.3 |
 | 8 | Check JSON Output Structure | Req 3.5 |
+
+### V4 Properties (Execution Identity)
+
+| # | Property | Validates |
+|---|----------|-----------|
+| 1 | Execution ID Determinism | Req 1.4, 2.4, 3.5, 7.1, 7.2, 7.4 |
+| 2 | Hash Format Compliance | Req 1.3, 2.3, 3.4 |
+| 3 | Execution ID Composition | Req 1.1, 1.2 |
+| 4 | Command Hash Sensitivity | Req 2.1, 2.2 |
+| 5 | Environment Hash Filtering | Req 3.1, 3.2, 7.3 |
+| 6 | Environment Hash Order Independence | Req 3.3 |
+| 7 | Execution Identity JSON Structure | Req 4.2, 4.3, 4.4 |
+| 8 | Execution ID Injection | Req 4.5 |
+| 9 | JSON Output Includes Execution ID | Req 5.3, 5.4 |
+| 10 | Backward Compatibility | Req 6.1, 6.2, 6.3 |
 
 Each property test runs 100 iterations with randomly generated inputs.
 

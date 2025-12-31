@@ -2123,3 +2123,447 @@ invariants:
 		t.Errorf("Expected invariants JSON in stdout, got: %s", stdout.String())
 	}
 }
+
+// ============================================================================
+// V4 Integration Tests - Execution Identity
+// ============================================================================
+
+// TestV4_ExecutionID_Flag tests the --execution-id flag
+func TestV4_ExecutionID_Flag(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	// Create a marker file to verify command execution
+	markerFile := filepath.Join(tmpDir, "marker.txt")
+
+	cmd := exec.Command(binPath, "run", "--execution-id", "sh", "-c", "echo done > "+markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected command to succeed, got error: %v", err)
+	}
+
+	// Stdout should contain execution ID
+	output := stdout.String()
+	if !bytes.Contains([]byte(output), []byte("sha256:")) {
+		t.Errorf("Expected execution ID in stdout, got: %s", output)
+	}
+
+	// Marker file should exist (command was executed)
+	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
+		t.Errorf("Expected marker file to be created")
+	}
+}
+
+// TestV4_ExecutionIDJSON_Flag tests the --execution-id-json flag
+func TestV4_ExecutionIDJSON_Flag(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "marker.txt")
+
+	cmd := exec.Command(binPath, "run", "--execution-id-json", "sh", "-c", "echo done > "+markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected command to succeed, got error: %v", err)
+	}
+
+	output := stdout.String()
+
+	// Should contain all required JSON fields
+	requiredFields := []string{
+		`"executionId"`,
+		`"configVersion"`,
+		`"commandHash"`,
+		`"environmentHash"`,
+		`"command"`,
+		`"args"`,
+	}
+	for _, field := range requiredFields {
+		if !bytes.Contains([]byte(output), []byte(field)) {
+			t.Errorf("Expected %s in JSON output, got: %s", field, output)
+		}
+	}
+}
+
+// TestV4_ExecutionIDFile_Flag tests the --execution-id-file flag
+func TestV4_ExecutionIDFile_Flag(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	execIDFile := filepath.Join(tmpDir, "execid.json")
+	markerFile := filepath.Join(tmpDir, "marker.txt")
+
+	cmd := exec.Command(binPath, "run", "--execution-id-file", execIDFile, "sh", "-c", "echo done > "+markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected command to succeed, got error: %v", err)
+	}
+
+	// Execution ID file should exist
+	if _, err := os.Stat(execIDFile); os.IsNotExist(err) {
+		t.Errorf("Expected execution ID file to be created")
+	}
+
+	// Read and verify content
+	content, err := os.ReadFile(execIDFile)
+	if err != nil {
+		t.Fatalf("Failed to read execution ID file: %v", err)
+	}
+
+	if !bytes.Contains(content, []byte(`"executionId"`)) {
+		t.Errorf("Expected executionId in file, got: %s", string(content))
+	}
+}
+
+// TestV4_ExecutionIDEnv_Flag tests the --execution-id-env flag
+func TestV4_ExecutionIDEnv_Flag(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	outputFile := filepath.Join(tmpDir, "env_output.txt")
+
+	// Use sh -c to echo the injected env var to a file
+	cmd := exec.Command(binPath, "run", "--execution-id-env", "EXEC_ID", "sh", "-c", "echo $EXEC_ID > "+outputFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected command to succeed, got error: %v", err)
+	}
+
+	// Read the output file
+	content, err := os.ReadFile(outputFile)
+	if err != nil {
+		t.Fatalf("Failed to read output file: %v", err)
+	}
+
+	// Should contain sha256: prefix
+	if !bytes.Contains(content, []byte("sha256:")) {
+		t.Errorf("Expected EXEC_ID env var to contain sha256:, got: %s", string(content))
+	}
+}
+
+// TestV4_CheckWithExecutionID tests check --execution-id
+func TestV4_CheckWithExecutionID(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	cmd := exec.Command(binPath, "check", "--execution-id")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected check to succeed, got error: %v", err)
+	}
+
+	output := stdout.String()
+	if !bytes.Contains([]byte(output), []byte("sha256:")) {
+		t.Errorf("Expected execution ID in stdout, got: %s", output)
+	}
+}
+
+// TestV4_DryRunWithExecutionID tests dry-run --execution-id
+func TestV4_DryRunWithExecutionID(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "marker.txt")
+
+	cmd := exec.Command(binPath, "run", "--dry-run", "--execution-id", "sh", "-c", "echo done > "+markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected dry-run to succeed, got error: %v", err)
+	}
+
+	output := stdout.String()
+	if !bytes.Contains([]byte(output), []byte("sha256:")) {
+		t.Errorf("Expected execution ID in stdout, got: %s", output)
+	}
+
+	// Marker file should NOT exist (dry-run doesn't execute)
+	if _, err := os.Stat(markerFile); !os.IsNotExist(err) {
+		t.Errorf("Expected marker file to NOT be created in dry-run mode")
+	}
+}
+
+// TestV4_CheckJSONIncludesExecutionID tests check --json includes executionId
+func TestV4_CheckJSONIncludesExecutionID(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	cmd := exec.Command(binPath, "check", "--json")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected check to succeed, got error: %v", err)
+	}
+
+	output := stdout.String()
+	if !bytes.Contains([]byte(output), []byte(`"executionId"`)) {
+		t.Errorf("Expected executionId in JSON output, got: %s", output)
+	}
+}
+
+// TestV4_DryRunJSONIncludesExecutionID tests dry-run --json includes executionId
+func TestV4_DryRunJSONIncludesExecutionID(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	cmd := exec.Command(binPath, "run", "--dry-run", "--json", "echo", "hello")
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected dry-run to succeed, got error: %v", err)
+	}
+
+	output := stdout.String()
+	if !bytes.Contains([]byte(output), []byte(`"executionId"`)) {
+		t.Errorf("Expected executionId in JSON output, got: %s", output)
+	}
+}
+
+// TestV4_BackwardCompatibility tests that v3 invocations still work
+func TestV4_BackwardCompatibility(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "marker.txt")
+
+	// v3 invocation without v4 flags
+	cmd := exec.Command(binPath, "run", "sh", "-c", "echo done > "+markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected command to succeed, got error: %v", err)
+	}
+
+	// Stdout should be empty (silent success)
+	if stdout.Len() != 0 {
+		t.Errorf("Expected silent success, got stdout: %s", stdout.String())
+	}
+
+	// Marker file should exist
+	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
+		t.Errorf("Expected marker file to be created")
+	}
+}
+
+// TestV4_V1IdentityStillWorks tests that v1 identity flags still work alongside v4
+func TestV4_V1IdentityStillWorks(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	markerFile := filepath.Join(tmpDir, "marker.txt")
+
+	// Use both v1 --identity and v4 --execution-id
+	cmd := exec.Command(binPath, "run", "--identity", "--execution-id", "sh", "-c", "echo done > "+markerFile)
+	cmd.Dir = tmpDir
+	cmd.Env = []string{
+		"DB_URL=postgres://localhost/test",
+		"PATH=" + os.Getenv("PATH"),
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("Expected command to succeed, got error: %v", err)
+	}
+
+	output := stdout.String()
+
+	// Should contain v1 identity JSON (codeHash, configHash, executionId)
+	if !bytes.Contains([]byte(output), []byte(`"codeHash"`)) {
+		t.Errorf("Expected v1 identity codeHash in output, got: %s", output)
+	}
+
+	// Should also contain v4 execution ID (separate line)
+	// The v4 execution ID is printed after v1 identity
+	if !bytes.Contains([]byte(output), []byte("sha256:")) {
+		t.Errorf("Expected v4 execution ID in output, got: %s", output)
+	}
+}
+
+// TestV4_ExecutionIDDeterminism tests that same inputs produce same execution ID
+func TestV4_ExecutionIDDeterminism(t *testing.T) {
+	binPath := buildAdmitBinary(t)
+	defer os.RemoveAll(filepath.Dir(binPath))
+
+	schemaContent := `config:
+  db.url:
+    type: string
+    required: true
+`
+	tmpDir := createTestSchema(t, schemaContent)
+	defer os.RemoveAll(tmpDir)
+
+	getExecID := func() string {
+		cmd := exec.Command(binPath, "check", "--execution-id")
+		cmd.Dir = tmpDir
+		cmd.Env = []string{
+			"DB_URL=postgres://localhost/test",
+		}
+
+		var stdout bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Run()
+		return stdout.String()
+	}
+
+	// Run multiple times
+	id1 := getExecID()
+	id2 := getExecID()
+	id3 := getExecID()
+
+	// All should be identical
+	if id1 != id2 || id2 != id3 {
+		t.Errorf("Expected deterministic execution IDs, got: %s, %s, %s", id1, id2, id3)
+	}
+}

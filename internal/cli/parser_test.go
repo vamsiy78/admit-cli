@@ -658,3 +658,218 @@ func TestParseArgs_BackwardCompatibility_Property(t *testing.T) {
 
 	properties.TestingRun(t)
 }
+
+
+// TestParseArgs_V4Flags tests the new v4 execution identity flags
+func TestParseArgs_V4Flags(t *testing.T) {
+	tests := []struct {
+		name            string
+		args            []string
+		wantTarget      string
+		wantExecID      bool
+		wantExecIDJSON  bool
+		wantExecIDFile  string
+		wantExecIDEnv   string
+	}{
+		{
+			name:       "execution-id flag",
+			args:       []string{"run", "--execution-id", "echo"},
+			wantTarget: "echo",
+			wantExecID: true,
+		},
+		{
+			name:           "execution-id-json flag",
+			args:           []string{"run", "--execution-id-json", "echo"},
+			wantTarget:     "echo",
+			wantExecIDJSON: true,
+		},
+		{
+			name:           "execution-id-file flag",
+			args:           []string{"run", "--execution-id-file", "/tmp/execid.json", "echo"},
+			wantTarget:     "echo",
+			wantExecIDFile: "/tmp/execid.json",
+		},
+		{
+			name:          "execution-id-env flag",
+			args:          []string{"run", "--execution-id-env", "EXEC_ID", "echo"},
+			wantTarget:    "echo",
+			wantExecIDEnv: "EXEC_ID",
+		},
+		{
+			name:           "all v4 flags",
+			args:           []string{"run", "--execution-id", "--execution-id-json", "--execution-id-file", "/tmp/id.json", "--execution-id-env", "EXEC_ID", "node", "app.js"},
+			wantTarget:     "node",
+			wantExecID:     true,
+			wantExecIDJSON: true,
+			wantExecIDFile: "/tmp/id.json",
+			wantExecIDEnv:  "EXEC_ID",
+		},
+		{
+			name:       "v4 flags with v1 identity flags",
+			args:       []string{"run", "--execution-id", "--identity", "--identity-short", "echo"},
+			wantTarget: "echo",
+			wantExecID: true,
+		},
+		{
+			name:       "v4 flags with v3 flags",
+			args:       []string{"run", "--execution-id", "--dry-run", "echo"},
+			wantTarget: "echo",
+			wantExecID: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, err := ParseArgs(tt.args)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cmd.Target != tt.wantTarget {
+				t.Errorf("Target = %q, want %q", cmd.Target, tt.wantTarget)
+			}
+			if cmd.ExecutionID != tt.wantExecID {
+				t.Errorf("ExecutionID = %v, want %v", cmd.ExecutionID, tt.wantExecID)
+			}
+			if cmd.ExecutionIDJSON != tt.wantExecIDJSON {
+				t.Errorf("ExecutionIDJSON = %v, want %v", cmd.ExecutionIDJSON, tt.wantExecIDJSON)
+			}
+			if cmd.ExecutionIDFile != tt.wantExecIDFile {
+				t.Errorf("ExecutionIDFile = %q, want %q", cmd.ExecutionIDFile, tt.wantExecIDFile)
+			}
+			if cmd.ExecutionIDEnv != tt.wantExecIDEnv {
+				t.Errorf("ExecutionIDEnv = %q, want %q", cmd.ExecutionIDEnv, tt.wantExecIDEnv)
+			}
+		})
+	}
+}
+
+// TestParseArgs_V4FlagErrors tests error cases for v4 flags
+func TestParseArgs_V4FlagErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr error
+	}{
+		{
+			name:    "execution-id-file without value",
+			args:    []string{"run", "--execution-id-file"},
+			wantErr: ErrMissingFlagValue,
+		},
+		{
+			name:    "execution-id-env without value",
+			args:    []string{"run", "--execution-id-env"},
+			wantErr: ErrMissingFlagValue,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseArgs(tt.args)
+			if err != tt.wantErr {
+				t.Errorf("error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// Feature: admit-v4-execution-identity, Property 10: Backward Compatibility
+// Validates: Requirements 6.1, 6.2, 6.3
+// For any v3-compatible invocation (no v4 flags), behavior SHALL be identical to v3.
+// The v1 identity flags SHALL continue to function independently of v4 execution-id flags.
+func TestParseArgs_V4BackwardCompatibility_Property(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	// Property: v3 invocations still work
+	properties.Property("v3 invocations parse correctly without v4 flags set", prop.ForAll(
+		func(target string, args []string) bool {
+			if target == "" {
+				return true // Skip empty targets
+			}
+			// Build v3-style args: ["run", target, arg1, arg2, ...]
+			inputArgs := append([]string{"run", target}, args...)
+			cmd, err := ParseArgs(inputArgs)
+			if err != nil {
+				return false
+			}
+			// Verify subcommand is run
+			if cmd.Subcommand != SubcommandRun {
+				return false
+			}
+			// Verify target is preserved
+			if cmd.Target != target {
+				return false
+			}
+			// Verify args are preserved
+			if len(cmd.Args) != len(args) {
+				return false
+			}
+			for i, arg := range args {
+				if cmd.Args[i] != arg {
+					return false
+				}
+			}
+			// Verify v4 flags are not set
+			if cmd.ExecutionID || cmd.ExecutionIDJSON || cmd.ExecutionIDFile != "" || cmd.ExecutionIDEnv != "" {
+				return false
+			}
+			return true
+		},
+		gen.Identifier(),
+		gen.SliceOf(gen.AlphaString()),
+	))
+
+	// Property: v1 identity flags still work independently
+	properties.Property("v1 identity flags work independently of v4 flags", prop.ForAll(
+		func(target string) bool {
+			if target == "" {
+				return true
+			}
+			// Test with v1 identity flags
+			args := []string{"run", "--identity", "--identity-short", target}
+			cmd, err := ParseArgs(args)
+			if err != nil {
+				return false
+			}
+			return cmd.Target == target && cmd.Identity && cmd.IdentityShort
+		},
+		gen.Identifier(),
+	))
+
+	// Property: v1 and v4 identity flags can be used together
+	properties.Property("v1 and v4 identity flags can coexist", prop.ForAll(
+		func(target string) bool {
+			if target == "" {
+				return true
+			}
+			// Test with both v1 and v4 identity flags
+			args := []string{"run", "--identity", "--execution-id", target}
+			cmd, err := ParseArgs(args)
+			if err != nil {
+				return false
+			}
+			return cmd.Target == target && cmd.Identity && cmd.ExecutionID
+		},
+		gen.Identifier(),
+	))
+
+	// Property: v3 flags still work with v4 flags
+	properties.Property("v3 flags work alongside v4 flags", prop.ForAll(
+		func(target string) bool {
+			if target == "" {
+				return true
+			}
+			args := []string{"run", "--dry-run", "--execution-id", target}
+			cmd, err := ParseArgs(args)
+			if err != nil {
+				return false
+			}
+			return cmd.Target == target && cmd.DryRun && cmd.ExecutionID
+		},
+		gen.Identifier(),
+	))
+
+	properties.TestingRun(t)
+}

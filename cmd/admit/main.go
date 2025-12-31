@@ -8,6 +8,7 @@ import (
 
 	"admit/internal/artifact"
 	"admit/internal/cli"
+	"admit/internal/execid"
 	"admit/internal/identity"
 	"admit/internal/injector"
 	"admit/internal/invariant"
@@ -126,9 +127,19 @@ func run(args []string, environ []string, defaultSchemaDir string) int {
 
 	// Handle check subcommand - validation only, no execution
 	if cmd.Subcommand == cli.SubcommandCheck {
+		// Compute execution ID for check mode (uses placeholder command hash)
+		schemaKeys := getSchemaKeys(s)
+		art := artifact.GenerateArtifact(resolved)
+		execID := execid.ComputeExecutionID(art.ConfigVersion, "", []string{}, environ, schemaKeys)
+
+		// Handle execution ID flags in check mode
+		if cmd.ExecutionID {
+			fmt.Println(execID.Short())
+		}
+
 		if cmd.JSONOutput {
-			fmt.Println(formatCheckJSON(true, result.Errors, invResults, schemaPath))
-		} else {
+			fmt.Println(formatCheckJSONWithExecID(true, result.Errors, invResults, schemaPath, execID.Short()))
+		} else if !cmd.ExecutionID {
 			fmt.Println("✓ Config valid")
 		}
 		return 0
@@ -136,9 +147,19 @@ func run(args []string, environ []string, defaultSchemaDir string) int {
 
 	// Handle dry-run mode - validation only, no execution
 	if cmd.DryRun {
+		// Compute execution ID for dry-run mode
+		schemaKeys := getSchemaKeys(s)
+		art := artifact.GenerateArtifact(resolved)
+		execID := execid.ComputeExecutionID(art.ConfigVersion, cmd.Target, cmd.Args, environ, schemaKeys)
+
+		// Handle execution ID flags in dry-run mode
+		if cmd.ExecutionID {
+			fmt.Println(execID.Short())
+		}
+
 		if cmd.JSONOutput {
-			fmt.Println(formatDryRunJSON(true, cmd.Target, cmd.Args, schemaPath))
-		} else {
+			fmt.Println(formatDryRunJSONWithExecID(true, cmd.Target, cmd.Args, schemaPath, execID.Short()))
+		} else if !cmd.ExecutionID {
 			fmt.Printf("Config valid, would execute: %s %s\n", cmd.Target, strings.Join(cmd.Args, " "))
 		}
 		return 0
@@ -192,6 +213,38 @@ func run(args []string, environ []string, defaultSchemaDir string) int {
 				return 1
 			}
 			fmt.Println(string(jsonBytes))
+		}
+	}
+
+	// Handle v4 execution identity flags
+	if cmd.ExecutionID || cmd.ExecutionIDJSON || cmd.ExecutionIDFile != "" || cmd.ExecutionIDEnv != "" {
+		// Get schema keys for environment hash filtering
+		schemaKeys := getSchemaKeys(s)
+
+		// Compute v4 execution identity
+		execID := execid.ComputeExecutionID(art.ConfigVersion, cmd.Target, cmd.Args, environ, schemaKeys)
+
+		if cmd.ExecutionIDFile != "" {
+			if err := execID.WriteToFile(cmd.ExecutionIDFile); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: cannot write execution identity: %s: %v\n", cmd.ExecutionIDFile, err)
+				return 1
+			}
+		}
+
+		if cmd.ExecutionIDJSON {
+			jsonBytes, err := execID.ToJSON()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: cannot serialize execution identity: %v\n", err)
+				return 1
+			}
+			fmt.Println(string(jsonBytes))
+		} else if cmd.ExecutionID {
+			fmt.Println(execID.Short())
+		}
+
+		// Inject execution ID into environment if requested
+		if cmd.ExecutionIDEnv != "" {
+			environ = append(environ, cmd.ExecutionIDEnv+"="+execID.Short())
 		}
 	}
 
@@ -286,6 +339,11 @@ func formatCIAnnotation(err validator.ValidationError) string {
 
 // formatCheckJSON formats check results as JSON
 func formatCheckJSON(valid bool, valErrors []validator.ValidationError, invResults []invariant.InvariantResult, schemaPath string) string {
+	return formatCheckJSONWithExecID(valid, valErrors, invResults, schemaPath, "")
+}
+
+// formatCheckJSONWithExecID formats check results as JSON with optional execution ID
+func formatCheckJSONWithExecID(valid bool, valErrors []validator.ValidationError, invResults []invariant.InvariantResult, schemaPath string, executionID string) string {
 	// Simple JSON formatting without external dependencies
 	var sb strings.Builder
 	sb.WriteString("{")
@@ -307,12 +365,20 @@ func formatCheckJSON(valid bool, valErrors []validator.ValidationError, invResul
 	}
 	sb.WriteString("],")
 	sb.WriteString(fmt.Sprintf(`"schemaPath":"%s"`, escapeJSON(schemaPath)))
+	if executionID != "" {
+		sb.WriteString(fmt.Sprintf(`,"executionId":"%s"`, escapeJSON(executionID)))
+	}
 	sb.WriteString("}")
 	return sb.String()
 }
 
 // formatDryRunJSON formats dry-run results as JSON
 func formatDryRunJSON(valid bool, command string, args []string, schemaPath string) string {
+	return formatDryRunJSONWithExecID(valid, command, args, schemaPath, "")
+}
+
+// formatDryRunJSONWithExecID formats dry-run results as JSON with optional execution ID
+func formatDryRunJSONWithExecID(valid bool, command string, args []string, schemaPath string, executionID string) string {
 	var sb strings.Builder
 	sb.WriteString("{")
 	sb.WriteString(fmt.Sprintf(`"valid":%t,`, valid))
@@ -326,6 +392,9 @@ func formatDryRunJSON(valid bool, command string, args []string, schemaPath stri
 	}
 	sb.WriteString("],")
 	sb.WriteString(fmt.Sprintf(`"schemaPath":"%s"`, escapeJSON(schemaPath)))
+	if executionID != "" {
+		sb.WriteString(fmt.Sprintf(`,"executionId":"%s"`, escapeJSON(executionID)))
+	}
 	sb.WriteString("}")
 	return sb.String()
 }
@@ -338,4 +407,13 @@ func escapeJSON(s string) string {
 	s = strings.ReplaceAll(s, "\r", `\r`)
 	s = strings.ReplaceAll(s, "\t", `\t`)
 	return s
+}
+
+// getSchemaKeys extracts config key paths from the schema
+func getSchemaKeys(s schema.Schema) []string {
+	keys := make([]string, 0, len(s.Config))
+	for key := range s.Config {
+		keys = append(keys, key)
+	}
+	return keys
 }

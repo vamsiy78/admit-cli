@@ -50,6 +50,12 @@ type Command struct {
 	DryRun     bool   // --dry-run
 	CIMode     bool   // --ci
 	JSONOutput bool   // --json (for check subcommand)
+
+	// v4 Execution Identity flags
+	ExecutionID     bool   // --execution-id
+	ExecutionIDJSON bool   // --execution-id-json
+	ExecutionIDFile string // --execution-id-file <path>
+	ExecutionIDEnv  string // --execution-id-env <varname>
 }
 
 // ParseArgs parses CLI arguments into a Command.
@@ -129,6 +135,22 @@ func ParseArgs(args []string) (Command, error) {
 				cmd.CIMode = true
 			case "json":
 				cmd.JSONOutput = true
+			case "execution-id":
+				cmd.ExecutionID = true
+			case "execution-id-json":
+				cmd.ExecutionIDJSON = true
+			case "execution-id-file":
+				if i+1 >= len(args) {
+					return Command{}, ErrMissingFlagValue
+				}
+				i++
+				cmd.ExecutionIDFile = args[i]
+			case "execution-id-env":
+				if i+1 >= len(args) {
+					return Command{}, ErrMissingFlagValue
+				}
+				i++
+				cmd.ExecutionIDEnv = args[i]
 			default:
 				// Unknown flag - treat as start of command
 				break
